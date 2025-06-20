@@ -522,6 +522,8 @@ def get_minari(
         terminals = []
         timeouts = []
 
+        debug_rewards = []
+
         for ep in _dataset:
             if env_type == _MinariEnvType.BOX:
                 _observations = ep.observations
@@ -552,11 +554,17 @@ def get_minari(
                     )
             else:
                 raise ValueError("Unsupported observation format.")
-            observations.append(_observations)
+            observations.append(_observations[:-1])
             actions.append(ep.actions)
             rewards.append(ep.rewards)
             terminals.append(ep.terminations)
             timeouts.append(ep.truncations)
+
+            debug_rewards.append(ep.rewards.sum())
+        
+        print(f"Max return: {max(debug_rewards)}, "
+              f"Min return: {min(debug_rewards)}, "
+              f"Mean return: {sum(debug_rewards) / len(debug_rewards)}")
 
         if tuple_observation:
             stacked_observations = tuple(
