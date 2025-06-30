@@ -12,7 +12,7 @@ import torch
 from typing import List, Optional, Callable
 import numpy as np
 
-__all__ = ["MDPDataset", "EpisodeDataset"]
+__all__ = ["MDPDataset", "EpisodeDataset", "EpisodeWindowDataset"]
 
 
 class MDPDataset(ReplayBuffer):
@@ -163,3 +163,24 @@ class EpisodeDataset(Dataset):  # <- Changed from ReplayBuffer to Dataset
             torch.tensor(ep.actions, dtype=torch.float32),       # shape: (T, act_dim)
             torch.tensor(self.weights[idx], dtype=torch.float32) # scalar weight
         )
+
+class EpisodeWindowDataset(torch.utils.data.Dataset):
+    def __init__(self, episode_dataset: EpisodeDataset, seq_len: int = 5):
+        self.seq_len = seq_len
+        self.sequences = []
+
+        for ep_obs, ep_act, weight in episode_dataset:
+            T = ep_obs.shape[0]
+            if T < seq_len:
+                continue  # skip episodes shorter than required window
+            for start in range(T - seq_len + 1):
+                obs_seq = ep_obs[start:start + seq_len]  # (5, obs_dim)
+                act_seq = ep_act[start:start + seq_len]  # (5, act_dim)
+                self.sequences.append((obs_seq, act_seq, weight))
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return self.sequences[idx]  # returns: (obs_seq, act_seq, weight)
+

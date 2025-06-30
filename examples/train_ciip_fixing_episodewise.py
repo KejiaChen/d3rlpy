@@ -167,10 +167,11 @@ def export_to_onnx(policy, obs_dim, export_path="mlp_policy.onnx"):
 
 if __name__ == "__main__":
     train = True # Set to False to skip training and only evaluate
+    reload_data= False # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
 
     '''prepare the dataset'''
-    reload_data=False
+    
 
     dataset_base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/"
     dataset = load_trajectories(dataset_base_dir, env_step=update_step, reload_data=reload_data)
@@ -201,12 +202,13 @@ if __name__ == "__main__":
                             )
     
     log_base_dir = "/home/tp2/Documents/kejia/d3rlpy/d3rlpy_logs/Clip_Weighted_BC/"
+    log_stored_folder = "20250629_170553"
     if train:
         log_dir = os.path.join(log_base_dir, time.strftime("%Y%m%d_%H%M%S"))
         if not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
     else:
-        log_dir = os.path.join(log_base_dir, "20250629_170553")
+        log_dir = os.path.join(log_base_dir, log_stored_folder)
 
     policy_path = os.path.join(log_dir, "trained_BC_policy.pth")
 

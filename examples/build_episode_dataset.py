@@ -175,7 +175,7 @@ def load_trajectories(base_dir, env_step=5, reload_data=True):
             acts_buffer = acts_buffer_downsampled[:]
             terminals_buffer = terminals_downsampled[:]
 
-            # calcuate reward
+            # calculate reward
             ep_return = return_function(obs_buffer)
             # save reward to a file
             np.savetxt(os.path.join(traj_path, "return.txt"), np.array([ep_return ]), fmt='%.6f')
