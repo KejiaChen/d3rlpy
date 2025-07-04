@@ -28,6 +28,7 @@ def check_success(traj_path, obs_buffer, acts_buffer):
         terminate_index = obs_buffer.shape[0]
         print(f"\033[91mTrajectory {traj_path} is not successful, skipping fixing check.\033[0m")
     else:
+        # TODO@KejiaChen: the analyzer is not as accurate as its cpp version
         for i in range(obs_buffer.shape[0]):
             analyzer.update_sensor_data(push_ext[i], push_ff[i])
             if analyzer.get_contactlos():
@@ -108,7 +109,7 @@ def preprocess_observation(obs_buffer, env_step=5):
     ], axis=1)
 
 
-def return_function(obs):
+def return_function(obs, ref_stretch_force=7.0, ref_push_force=7.0, ref_deformation=0.01, ref_duration=1000):
     # === 1. Extract Metrics ===
     stretch_force = np.max(np.abs(obs[:, 0])) # np.mean
     push_force = np.max(np.abs(obs[:, 3]))
@@ -116,16 +117,16 @@ def return_function(obs):
     duration = obs.shape[0]  # number of steps
 
     # === 2. Define Ideal Reference Values (based on expert or dataset stats) ===
-    REF_STRETCH_FORCE = 7.0
-    REF_PUSH_FORCE = 7.0
-    REF_DEFORMATION = 0.01
-    REF_DURATION = 1000  
+    # REF_STRETCH_FORCE = 7.0
+    # REF_PUSH_FORCE = 7.0
+    # REF_DEFORMATION = 0.01
+    # REF_DURATION = 1000  
 
     # === 3. Compute Positive Reward by Deviation ===
-    stretch_score = 1.0 - (stretch_force - REF_STRETCH_FORCE) / REF_STRETCH_FORCE
-    push_score = 1.0 - (push_force - REF_PUSH_FORCE) / REF_PUSH_FORCE
-    deform_score = 1.0 - (deformation - REF_DEFORMATION) / REF_DEFORMATION
-    time_score = 1.0 - (duration - REF_DURATION) / REF_DURATION
+    stretch_score = 1.0 - (stretch_force - ref_stretch_force) / ref_stretch_force
+    push_score = 1.0 - (push_force - ref_push_force) / ref_push_force
+    deform_score = 1.0 - (deformation - ref_deformation) / ref_deformation
+    time_score = 1.0 - (duration - ref_duration) / ref_duration
 
     # Clip scores to [0, 1]
     # stretch_score = np.clip(stretch_score, 0.0, 1.0)
@@ -136,6 +137,36 @@ def return_function(obs):
     ep_return = 10*stretch_score + 10*push_score + 10*deform_score + 10*time_score
 
     return ep_return
+
+def load_one_episode(traj_path, env_step=5):
+    base_dir = os.path.dirname(traj_path)
+    traj_dir = os.path.basename(os.path.normpath(traj_path))
+
+    obs_buffer_raw = np.loadtxt(os.path.join(traj_path, "observations.txt"))
+    acts_buffer_raw = np.loadtxt(os.path.join(traj_path, "actions.txt"))
+    # check success
+    terminals_raw, terminal_index_raw = load_and_preprocess_terminal(traj_path, obs_buffer_raw, acts_buffer_raw)
+    # downsample
+    obs_buffer_downsampled = preprocess_observation(obs_buffer_raw, env_step=env_step)
+    acts_buffer_downsampled  = preprocess_action(acts_buffer_raw, env_step=env_step)
+    terminals_downsampled = np.concatenate([
+                                terminals_raw[::env_step],
+                                [terminals_raw[-1]] if (terminals_raw.shape[0]) % env_step != 0 else np.empty(0, dtype=terminals_raw.dtype)
+                            ])
+    terminal_index_downsampled = terminal_index_raw // env_step
+    print(f"Trajectory {traj_dir} has {obs_buffer_downsampled.shape[0]} steps after downsampling.")
+
+    obs_buffer = obs_buffer_downsampled[:]
+    acts_buffer = acts_buffer_downsampled[:]
+    terminals_buffer = terminals_downsampled[:]
+
+    # calculate reward
+    ep_return = return_function(obs_buffer)
+    # save reward to a file
+    np.savetxt(os.path.join(traj_path, "return.txt"), np.array([ep_return ]), fmt='%.6f')
+    print(f"\033[93mExpected return for trajectory {traj_dir}: {ep_return} with {obs_buffer.shape[0]} steps.\033[0m")
+    plot_force(obs_buffer, acts_buffer, base_dir, traj_dir)
+    return obs_buffer, acts_buffer, ep_return, terminals_downsampled, terminals_buffer
 
 def load_trajectories(base_dir, env_step=5, reload_data=True):
     if not reload_data and os.path.exists(os.path.join(base_dir, "episode_dataset.npz")):
@@ -157,30 +188,7 @@ def load_trajectories(base_dir, env_step=5, reload_data=True):
             traj_path = os.path.join(base_dir, traj_dir)
             if not os.path.isdir(traj_path):  # Skip files like "episode_dataset.npz"
                 continue
-            obs_buffer_raw = np.loadtxt(os.path.join(traj_path, "observations.txt"))
-            acts_buffer_raw = np.loadtxt(os.path.join(traj_path, "actions.txt"))
-            # check success
-            terminals_raw, terminal_index_raw = load_and_preprocess_terminal(traj_path, obs_buffer_raw, acts_buffer_raw)
-            # downsample
-            obs_buffer_downsampled = preprocess_observation(obs_buffer_raw, env_step=env_step)
-            acts_buffer_downsampled  = preprocess_action(acts_buffer_raw, env_step=env_step)
-            terminals_downsampled = np.concatenate([
-                                        terminals_raw[::env_step],
-                                        [terminals_raw[-1]] if (terminals_raw.shape[0]) % env_step != 0 else np.empty(0, dtype=terminals_raw.dtype)
-                                    ])
-            terminal_index_downsampled = terminal_index_raw // env_step
-            print(f"Trajectory {traj_dir} has {obs_buffer_downsampled.shape[0]} steps after downsampling.")
-
-            obs_buffer = obs_buffer_downsampled[:]
-            acts_buffer = acts_buffer_downsampled[:]
-            terminals_buffer = terminals_downsampled[:]
-
-            # calculate reward
-            ep_return = return_function(obs_buffer)
-            # save reward to a file
-            np.savetxt(os.path.join(traj_path, "return.txt"), np.array([ep_return ]), fmt='%.6f')
-            print(f"\033[93mExpected return for trajectory {traj_dir}: {ep_return} with {obs_buffer.shape[0]} steps.\033[0m")
-            plot_force(obs_buffer, acts_buffer, base_dir, traj_dir)
+            obs_buffer, acts_buffer, ep_return, terminals_downsampled, terminals_buffer = load_one_episode(traj_path, env_step=env_step)
             
             all_observations.append(obs_buffer)
             all_actions.append(acts_buffer)
