@@ -159,12 +159,12 @@ if __name__ == "__main__":
             try:
                 os.remove(flag_path)
                 print(f"[✓] Remove {flag_path}")
-                time.sleep(1)  # wait for the flag file to appear
+                time.sleep(1)  # wait for the flag file to be removed
 
                 if os.path.exists(flag_path):
                     os.remove(flag_path)
                     print(f"[✓] Remove {flag_path} again")
-                    time.sleep(1)  # wait for the flag file to appear
+                    time.sleep(1)  # wait for the flag file to be removed
                 else:
                     print(f"[✓] {flag_path} already removed")
 
