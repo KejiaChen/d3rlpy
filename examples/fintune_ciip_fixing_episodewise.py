@@ -9,8 +9,10 @@ from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import torch.optim as optim
 import torch.nn.functional as F
-from policies import MLPPolicy, StochasticMLPPolicy, export_to_onnx
+from policies import StochasticMLPPolicy, StochasticMLPSeqPolicy, export_to_onnx
 from train_ciip_fixing_episodewise import train_weighted_bc, evaluate_imitation_policy
+from return_functions import max_based_return_function, effort_based_return_function
+import json
 
 from build_episode_dataset import load_trajectories, load_one_episode
 import wandb
@@ -19,7 +21,38 @@ import os
 import matplotlib.pyplot as plt
 from d3rlpy.dataset import EpisodeWindowDataset
 
-def reinforce_update(policy, optimizer, obs_seq, act_seq, episode_return, baseline=None,  num_epochs=50, lr=1e-3, gamma=0.99):
+import signal
+import sys
+
+def signal_handler(sig, frame):
+    print("\n[✓] Ctrl+C detected. Saving all trial information...")
+    save_all_trials(trial_info, rl_log_dir)
+    sys.exit(0)
+
+def save_all_trials(trial_info, rl_log_dir):
+    save_path = os.path.join(rl_log_dir, "all_trials_info.json")
+    with open(save_path, "w") as f:
+        json.dump(trial_info, f, indent=4)
+    print(f"[✓] Saved all trial information to {save_path}")
+
+def make_sequence_window(obs: torch.Tensor, window_size: int) -> torch.Tensor:
+    """
+    Convert (T, obs_dim) tensor into (T, window_size, obs_dim) with left-zero padding.
+    Returns (T, window_size, obs_dim)
+    """
+    T, D = obs.shape
+    padding = torch.zeros((window_size - 1, D), dtype=obs.dtype)
+    padded = torch.cat([padding, obs], dim=0)  # shape: (T + W - 1, D)
+
+    # Stack sequences by collecting sliding windows
+    sequences = []
+    for i in range(T):
+        window = padded[i:i + window_size]  # shape: (window_size, D)
+        sequences.append(window)
+
+    return torch.stack(sequences, dim=0)  # shape: (T, window_size, D)
+
+def reinforce_update(policy, optimizer, obs_seq, act_seq, seq_window, episode_return, baseline=None,  num_epochs=50, gamma=0.99):
     """
     One-step REINFORCE update using a single trajectory.
 
@@ -35,13 +68,19 @@ def reinforce_update(policy, optimizer, obs_seq, act_seq, episode_return, baseli
         updated baseline
     """
     policy.train()
-
     obs = torch.tensor(obs_seq, dtype=torch.float32)        # (T, obs_dim)
+
+    if seq_window is not None and seq_window > 0:
+        obs_seq_windowed = make_sequence_window(obs, seq_window_len)  # (T, seq_window_len, obs_dim)
+        obs = obs_seq_windowed
+        
     acts = torch.tensor(act_seq, dtype=torch.float32)       # (T, act_dim)
 
     dist = policy.get_dist(obs)                             # Normal(mean, std)
     log_probs = dist.log_prob(acts).sum(dim=-1)             # (T,)
     log_prob_sum = log_probs.sum()
+    entropy = dist.entropy().sum(dim=-1).mean()
+    discounts = torch.tensor([gamma ** t for t in range(len(log_probs))])
 
     # Compute baseline (EMA)
     if baseline is None:
@@ -50,13 +89,16 @@ def reinforce_update(policy, optimizer, obs_seq, act_seq, episode_return, baseli
         baseline = 0.9 * baseline + 0.1 * episode_return
 
     advantage = episode_return - baseline
-    loss = -advantage * log_prob_sum
+    normalized_advantage = (episode_return - baseline) / (abs(baseline) + 1e-6)
+    loss = -normalized_advantage * log_prob_sum # - 0.01 * entropy  # Encourage exploration
+    print(f"Episode return: {episode_return:.2f}, Baseline: {baseline:.2f}, Loss: {loss.item():.4f}, Entropy: {entropy.item():.4f}")
 
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
     optimizer.step()
 
-    return policy, baseline
+    return policy, baseline, loss.item(), entropy.item()
 
 def find_current_dir(base_dir):
     """
@@ -79,7 +121,7 @@ def find_current_dir(base_dir):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="REINFORCE episode-wise training script")
-    parser.add_argument("--bc_log", type=str, default="20250702_190857", help="Base log directory for the pre-trained BC policy")
+    parser.add_argument("--bc_log", type=str, default="20250709_145701", help="Base log directory for the pre-trained BC policy")
     parser.add_argument("--update_step", type=int, default=5, help="Update step for the policy output (default: 5,  i.e. 200Hz for the 1000Hz robot control frequency)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate for the optimizer (default: 1e-3)")
     parser.add_argument("--num_epochs", type=int, default=4, help="Number of epochs for each training update (default: 4)")
@@ -96,10 +138,11 @@ if __name__ == "__main__":
             config = f.readlines()
         obs_dim = int(config[0].split(":")[1].strip())
         act_dim = int(config[1].split(":")[1].strip())
+        seq_window_len = int(config[2].split(":")[1].strip())
         # num_epochs = int(config[2].split(":")[1].strip())
         # batch_size = int(config[3].split(":")[1].strip())
         # lr = float(config[4].split(":")[1].strip())
-        policy_type = config[5].split(":")[1].strip()
+        policy_type = config[6].split(":")[1].strip()
     else:
         obs_dim = 6
         act_dim = 2
@@ -108,7 +151,10 @@ if __name__ == "__main__":
     if policy_type != "stochastic":
         raise ValueError("This script is designed for stochastic policies. Please use a stochastic policy.")
 
-    policy = StochasticMLPPolicy(obs_dim, act_dim)
+    if seq_window_len is not None and seq_window_len > 1:
+        policy = StochasticMLPSeqPolicy(obs_dim, act_dim, seq_len=seq_window_len)
+    else:
+        policy = StochasticMLPPolicy(obs_dim, act_dim)
     policy.load_state_dict(torch.load(bc_policy_path))
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
 
@@ -121,10 +167,13 @@ if __name__ == "__main__":
     wandb.init(project="REINFORCE_episodewise", name=f"run_{time.strftime('%Y%m%d_%H%M%S')}",
                config={"learning_rate": args.lr, "epochs": args.num_epochs})
     baseline = None  # running average return
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)  # <-- add this
 
     # flag to control training loop
     ort_log_base_dir = "/home/tp2/Documents/kejia/ort/policy_log/"
-    
+
+    trial_info = []  # List to store information for all trials
     trial_id = 0
     while True:
         latest_ort_dir = find_current_dir(ort_log_base_dir)
@@ -135,21 +184,40 @@ if __name__ == "__main__":
 
             try:
                 '''load the data'''
-                obs_buffer, acts_buffer, ep_return, terminals_downsampled, terminals_buffer = load_one_episode(latest_ort_dir, env_step=args.update_step)  # load one episode
+                dataset_base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/off_policy_2/"
+                ref_values = json.load(open(os.path.join(dataset_base_dir, "reference_values.json"), 'r'))
+                # load one episode
+                return_function = effort_based_return_function
+                obs_buffer, acts_buffer, ep_return, terminals_downsampled, terminals_buffer = load_one_episode(latest_ort_dir, 
+                                                                                                               env_step=args.update_step,
+                                                                                                               include_deformation_in_return=False,
+                                                                                                               return_fn=return_function,
+                                                                                                               return_kwargs=ref_values)  
 
                 '''train the policy'''
-                policy, baseline = reinforce_update(policy, optimizer, obs_buffer, acts_buffer, ep_return, num_epochs=args.num_epochs, lr=args.lr, baseline=baseline)
+                policy, baseline, loss, entropy = reinforce_update(policy, optimizer, obs_buffer, acts_buffer, seq_window_len, ep_return, num_epochs=args.num_epochs, baseline=baseline)
                 print(f"[✓] Training complete for trial_{trial_id}")
 
                 '''Save the policy and export to ONNX'''
                 rl_policy_path = os.path.join(rl_log_dir, f"trained_reinforce_policy_{str(trial_id)}.pth")
                 torch.save(policy.state_dict(),rl_policy_path)
-                export_to_onnx(policy, obs_dim, export_path=os.path.join(rl_log_dir, f"trained_reinforce_policy_{str(trial_id)}.onnx"))
+                export_to_onnx(policy, obs_dim, seq_window_len, export_path=os.path.join(rl_log_dir, f"trained_reinforce_policy_{str(trial_id)}.onnx"))
                 with open(os.path.join(rl_log_dir, f"config_{str(trial_id)}.txt"), "w") as f:
                     f.write(f"bc_policy: {args.bc_log}\n")
                     f.write(f"rl_data_dir: {latest_ort_dir}\n")
 
                 wandb.log({"epoch": trial_id, "return": ep_return, "baseline": baseline})
+
+                trial_info.append({
+                    "trial_id": trial_id,
+                    "return_function": return_function.__name__,
+                    "baseline": baseline,
+                    "return": ep_return,
+                    "loss": loss,
+                    "entropy": entropy,
+                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
+                })
+                save_all_trials(trial_info, rl_log_dir)  # <-- auto-save every trial
             except Exception as e:
                 print(f"[✗] Error during training trial_{trial_id}: {e}")
                 # Optionally keep the flag file for debugging

@@ -2,11 +2,49 @@ import numpy as np
 import os
 from d3rlpy.dataset import MDPDataset, EpisodeDataset
 from fixing_detection_no_smoothing import FFAnalyzerRTSlide 
+from return_functions import *
+import json
 
 # def success_threshold(criterion, threshold):
 
 from torch.utils.data import Dataset, DataLoader
 import torch
+
+def compute_average_reference_values(base_dir, env_step=5):
+    stretch_forces, stretch_effort, push_forces, push_effort, deformation_values, durations = [], [], [], [], [], []
+    dt = 0.001*env_step  # each env_step is 1 ms
+
+    for traj_dir in sorted(os.listdir(base_dir)):
+        traj_path = os.path.join(base_dir, traj_dir)
+        if not os.path.isdir(traj_path):
+            continue
+
+        obs_raw = np.loadtxt(os.path.join(traj_path, "observations.txt"))
+        obs = preprocess_observation(obs_raw, env_step=env_step)
+
+        if obs.shape[0] == 0:
+            continue  # skip empty
+
+        stretch_forces.append(np.max(np.abs(obs[:, 0])))
+        stretch_effort.append(np.sum(np.abs(obs[:, 0])) * dt)  # integrated effort
+        push_forces.append(np.max(np.abs(obs[:, 3])))
+        push_effort.append(np.sum(np.abs(obs[:, 3])) * dt)  # integrated effort
+        deformation_values.append(np.max(np.abs(obs[:, 4])))
+        durations.append(obs.shape[0])
+
+    ref_values = {
+        "ref_stretch_force": np.mean(stretch_forces),
+        "ref_stretch_effort": np.mean(stretch_effort),
+        "ref_push_force": np.mean(push_forces),
+        "ref_push_effort": np.mean(push_effort),
+        "ref_deformation": np.mean(deformation_values),
+        "ref_duration": np.mean(durations),
+        "dt": dt
+    }
+
+    print(f"\033[92mComputed reference values from demos: {ref_values}\033[0m")
+    return ref_values
+
 
 def check_success(traj_path, obs_buffer, acts_buffer):
     analyzer = FFAnalyzerRTSlide()
@@ -108,37 +146,7 @@ def preprocess_observation(obs_buffer, env_step=5):
         push_velocity,
     ], axis=1)
 
-
-def return_function(obs, ref_stretch_force=7.0, ref_push_force=7.0, ref_deformation=0.01, ref_duration=1000):
-    # === 1. Extract Metrics ===
-    stretch_force = np.max(np.abs(obs[:, 0])) # np.mean
-    push_force = np.max(np.abs(obs[:, 3]))
-    deformation = np.max(np.abs(obs[:, 4])) 
-    duration = obs.shape[0]  # number of steps
-
-    # === 2. Define Ideal Reference Values (based on expert or dataset stats) ===
-    # REF_STRETCH_FORCE = 7.0
-    # REF_PUSH_FORCE = 7.0
-    # REF_DEFORMATION = 0.01
-    # REF_DURATION = 1000  
-
-    # === 3. Compute Positive Reward by Deviation ===
-    stretch_score = 1.0 - (stretch_force - ref_stretch_force) / ref_stretch_force
-    push_score = 1.0 - (push_force - ref_push_force) / ref_push_force
-    deform_score = 1.0 - (deformation - ref_deformation) / ref_deformation
-    time_score = 1.0 - (duration - ref_duration) / ref_duration
-
-    # Clip scores to [0, 1]
-    # stretch_score = np.clip(stretch_score, 0.0, 1.0)
-    # push_score = np.clip(push_score, 0.0, 1.0)
-    # deform_score = np.clip(deform_score, 0.0, 1.0)
-    # time_score = np.clip(time_score, 0.0, 1.0)
-
-    ep_return = 10*stretch_score + 10*push_score + 10*deform_score + 10*time_score
-
-    return ep_return
-
-def load_one_episode(traj_path, env_step=5):
+def load_one_episode(traj_path, env_step=5, include_deformation_in_return=True, return_fn=None, return_kwargs=None):
     base_dir = os.path.dirname(traj_path)
     traj_dir = os.path.basename(os.path.normpath(traj_path))
 
@@ -161,17 +169,25 @@ def load_one_episode(traj_path, env_step=5):
     terminals_buffer = terminals_downsampled[:]
 
     # calculate reward
-    ep_return = return_function(obs_buffer)
+    # ep_return = return_function(obs_buffer, ref_stretch_force=10.0, ref_push_force=5.0, ref_deformation=0.005, ref_duration=500)
+    if return_fn is not None:
+        if return_kwargs is None:
+            return_kwargs = {}
+        ep_return = return_fn(obs_buffer, include_deformation_in_return, **return_kwargs)
+    else:
+        raise ValueError("return_fn must be provided to calculate the return.")
+
     # save reward to a file
     np.savetxt(os.path.join(traj_path, "return.txt"), np.array([ep_return ]), fmt='%.6f')
     print(f"\033[93mExpected return for trajectory {traj_dir}: {ep_return} with {obs_buffer.shape[0]} steps.\033[0m")
     plot_force(obs_buffer, acts_buffer, base_dir, traj_dir)
     return obs_buffer, acts_buffer, ep_return, terminals_downsampled, terminals_buffer
 
-def load_trajectories(base_dir, env_step=5, reload_data=True):
+def load_trajectories(base_dir, return_function, env_step=5, reload_data=True):
     if not reload_data and os.path.exists(os.path.join(base_dir, "episode_dataset.npz")):
         print(f"Loading existing episode dataset from {os.path.join(base_dir, 'episode_dataset.npz')}")
         data = np.load(os.path.join(base_dir, "episode_dataset.npz"), allow_pickle=True)
+        ref_values = json.load(open(os.path.join(base_dir, "reference_values.json"), 'r'))
         return EpisodeDataset(
             observations=data["observations"],
             actions=data["actions"],
@@ -179,6 +195,12 @@ def load_trajectories(base_dir, env_step=5, reload_data=True):
             returns=data["returns"]
         )
     else:
+        # === Step 1: compute reference values across all episodes ===
+        ref_values = compute_average_reference_values(base_dir, env_step=env_step)
+        # save as json
+        with open(os.path.join(base_dir, "reference_values.json"), 'w') as f:
+            json.dump(ref_values, f, indent=4)
+
         all_observations = []
         all_actions = []
         all_returns = []
@@ -188,7 +210,10 @@ def load_trajectories(base_dir, env_step=5, reload_data=True):
             traj_path = os.path.join(base_dir, traj_dir)
             if not os.path.isdir(traj_path):  # Skip files like "episode_dataset.npz"
                 continue
-            obs_buffer, acts_buffer, ep_return, terminals_downsampled, terminals_buffer = load_one_episode(traj_path, env_step=env_step)
+            obs_buffer, acts_buffer, ep_return, terminals_downsampled, terminals_buffer = load_one_episode(traj_path, 
+                                                                                                           env_step=env_step,
+                                                                                                           return_fn=return_function,
+                                                                                                           return_kwargs=ref_values)
             
             all_observations.append(obs_buffer)
             all_actions.append(acts_buffer)
@@ -285,7 +310,7 @@ class EpisodeBCDataset(Dataset):
 
 if __name__ == "__main__":
     base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/"
-    dataset = load_trajectories(base_dir, env_step=5)
+    dataset = load_trajectories(base_dir, max_based_return_function, env_step=5)
     print(f"Dataset loaded.")
 
     

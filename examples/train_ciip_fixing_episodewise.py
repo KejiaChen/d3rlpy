@@ -10,6 +10,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.optim as optim
 import torch.nn.functional as F
 from policies import MLPPolicy, MLPSeqPolicy, StochasticMLPPolicy, StochasticMLPSeqPolicy, export_to_onnx
+from return_functions import *
 
 from build_episode_dataset import load_trajectories
 import wandb
@@ -85,7 +86,6 @@ def collate_variable_episodes_windowed(batch, seq_len):
     mask_padded = pad_sequence(masks, batch_first=True, padding_value=False)  # (B, T*)
 
     return obs_padded, act_padded, torch.tensor(weights_out), mask_padded, torch.tensor(lengths)
-
 
 def compute_weighted_masked_bc_loss(obs_padded, act_padded, weights, mask, policy, policy_type="deterministic"):
     """
@@ -213,7 +213,7 @@ if __name__ == "__main__":
     train = True # Set to False to skip training and only evaluate
     reload_data= True # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
-    policy_type = "deterministic"  # "stochastic" for stochastic policy, "deterministic" for MLPPolicy
+    policy_type = "stochastic"  # "stochastic" for stochastic policy, "deterministic" for MLPPolicy
     train_epochs = 50
     learning_rate = 1e-3
     batch_size = 1
@@ -222,7 +222,8 @@ if __name__ == "__main__":
     '''prepare the dataset'''
 
     dataset_base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/off_policy_2/"
-    dataset = load_trajectories(dataset_base_dir, env_step=update_step, reload_data=reload_data) # observation (B, D)
+    return_function = effort_based_return_function  # or effort_based_return_function
+    dataset = load_trajectories(dataset_base_dir, return_function, env_step=update_step, reload_data=reload_data) # observation (B, D)
     # seq_dataset =  EpisodeWindowDataset(dataset, seq_len=seq_window_len)  # observation (B,T,D)
     
     # if seq_window_len is None or seq_window_len <= 1:
@@ -260,6 +261,7 @@ if __name__ == "__main__":
             f.write(f"batch_size: {batch_size}\n")
             f.write(f"lr: {learning_rate}\n")
             f.write(f"policy_type: {policy_type}\n")
+            f.write(f"return_function: {return_function.__name__}\n")
 
         policy = train_weighted_bc(
                                 train_dataset,
@@ -274,7 +276,7 @@ if __name__ == "__main__":
                                 save_epoch=50
                             )
     else:
-        log_stored_folder = "20250707_200405" #20250629_170553 #20250702_160901 20250707_200405
+        log_stored_folder = "20250709_141454" #20250629_170553 #20250702_160901 20250707_215329
         log_dir = os.path.join(log_base_dir, log_stored_folder)
 
     policy_path = os.path.join(log_dir, "trained_BC_policy.pth")
