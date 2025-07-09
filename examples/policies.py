@@ -107,20 +107,32 @@ class StochasticMLPSeqPolicy(nn.Module):
         self.mean_head = nn.Linear(dims[-1], act_dim)
         self.log_std = nn.Parameter(torch.zeros(act_dim))
 
-    def forward(self, obs_seq):  # obs_seq: (seq_len, obs_dim) or (B, seq_len, obs_dim)
-        if obs_seq.dim() == 3:
-            B, T, D = obs_seq.shape
-            obs_seq = obs_seq.view(B, T * D)
+    def forward(self, obs_seq):  
+        # Supports input: (B, T, S, D) or (B, S, D)
+        if obs_seq.dim() == 4:
+            B, T, S, D = obs_seq.shape
+            obs_seq = obs_seq.view(B * T, S * D)
+            out = self.mean_head(self.encoder(obs_seq))
+            return out.view(B, T, -1)
+        elif obs_seq.dim() == 3:
+            B, S, D = obs_seq.shape
+            obs_seq = obs_seq.view(B, S * D)
+            return self.mean_head(self.encoder(obs_seq))
         else:
-            obs_seq = obs_seq.view(-1)
-        return self.mean_head(self.encoder(obs_seq))
+            raise ValueError(f"Unsupported input shape: {obs_seq.shape}")
 
     def get_dist(self, obs_seq):
-        if obs_seq.dim() == 3:
-            B, T, D = obs_seq.shape
-            obs_seq = obs_seq.view(B, T * D)
+        # Same logic as forward()
+        if obs_seq.dim() == 4:
+            B, T, S, D = obs_seq.shape
+            obs_seq = obs_seq.view(B * T, S * D)
+            mean = self.mean_head(self.encoder(obs_seq)).view(B, T, -1)
+        elif obs_seq.dim() == 3:
+            B, S, D = obs_seq.shape
+            obs_seq = obs_seq.view(B, S * D)
+            mean = self.mean_head(self.encoder(obs_seq))
         else:
-            obs_seq = obs_seq.view(-1)
-        mean = self.mean_head(self.encoder(obs_seq))
+            raise ValueError(f"Unsupported input shape: {obs_seq.shape}")
+
         std = torch.exp(self.log_std)
         return torch.distributions.Normal(mean, std)
