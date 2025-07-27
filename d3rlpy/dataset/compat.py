@@ -136,6 +136,7 @@ class EpisodeDataset(Dataset):  # <- Changed from ReplayBuffer to Dataset
         terminals: List[np.ndarray],
         returns: List[float],
         timeouts: Optional[List[np.ndarray]] = None,
+        load_terminals: bool = False,
     ):
         self.episodes: List[ReturnEpisode] = []
         for i in range(len(observations)):
@@ -153,30 +154,47 @@ class EpisodeDataset(Dataset):  # <- Changed from ReplayBuffer to Dataset
         self.weights = np.array(returns, dtype=np.float32)
         self.weights = (self.weights - self.weights.min()) / max(1e-8, np.ptp(self.weights))
 
+        self.load_terminals = load_terminals
+
     def __len__(self):
         return len(self.episodes)
 
     def __getitem__(self, idx):
         ep = self.episodes[idx]
-        return (
-            torch.tensor(ep.observations, dtype=torch.float32),  # shape: (T, obs_dim)
-            torch.tensor(ep.actions, dtype=torch.float32),       # shape: (T, act_dim)
-            torch.tensor(self.weights[idx], dtype=torch.float32) # scalar weight
-        )
+        if self.load_terminals:
+            return (
+                torch.tensor(ep.observations, dtype=torch.float32),  # shape: (T, obs_dim)
+                torch.tensor(ep.actions, dtype=torch.float32),       # shape: (T, act_dim)
+                torch.tensor(self.weights[idx], dtype=torch.float32), # scalar weight
+                torch.tensor(ep.terminals, dtype=torch.float32)         # shape (T,)
+            )
+        else:
+            return (
+                torch.tensor(ep.observations, dtype=torch.float32),  # shape: (T, obs_dim)
+                torch.tensor(ep.actions, dtype=torch.float32),       # shape: (T, act_dim)
+                torch.tensor(self.weights[idx], dtype=torch.float32)  # scalar weight
+            )
 
+# !deprecated
 class EpisodeWindowDataset(torch.utils.data.Dataset):
     def __init__(self, episode_dataset: EpisodeDataset, seq_len: int = 5):
         self.seq_len = seq_len
-        self.sequences = []
+        self.ep_seqs= []
 
-        for ep_obs, ep_act, weight in episode_dataset:
+        for ep_obs, ep_act, weight, terminals in episode_dataset:
+            self.seq = []
             T = ep_obs.shape[0]
             if T < seq_len:
                 continue  # skip episodes shorter than required window
+            
+            # Add terminal flag as an extra input dimension
+            terminals = terminals.view(-1, 1)
+            obs_aug = torch.cat([ep_obs, terminals], dim=-1)  # (T, obs_dim + 1)
+
             for start in range(T - seq_len + 1):
-                obs_seq = ep_obs[start:start + seq_len]  # (5, obs_dim)
-                act_seq = ep_act[start:start + seq_len]  # (5, act_dim)
-                self.sequences.append((obs_seq, act_seq, weight))
+                obs_seq = obs_aug[start:start + seq_len]  # (seq_len, obs_dim)
+                act = ep_act[start + seq_len - 1]        # (act_dim,)
+                self.seq.append((obs_seq, act, weight))
 
     def __len__(self):
         return len(self.sequences)
