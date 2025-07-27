@@ -48,7 +48,7 @@ def collate_variable_episodes(batch):
 
     return obs_padded, act_padded, torch.tensor(weights), mask, lengths
 
-def collate_variable_episodes_windowed(batch, seq_len):
+def collate_variable_episodes_windowed(batch, seq_len, include_terminal=False):
     """
     Args:
         batch: List of (obs: Tensor(T, obs_dim), act: Tensor(T, act_dim), weight: float)
@@ -66,10 +66,19 @@ def collate_variable_episodes_windowed(batch, seq_len):
     lengths = []
     weights_out = []
 
-    for obs, act, weight in batch:
+    for data in batch:
+        if include_terminal:
+            obs, act, weight, terminals = data
+            terminals = terminals.view(-1, 1)                    # (T, 1)
+            obs = torch.cat([obs, terminals], dim=-1)           # (T, obs_dim + 1)
+        else:
+            obs, act, weight = data
+
+    # for obs, act, weight in batch:
         T = obs.shape[0]
         if T < seq_len:
             continue
+
         obs_seq = torch.stack([obs[i:i+seq_len] for i in range(T - seq_len + 1)])  # (T - seq_len + 1, seq_len, obs_dim)
         act_seq = act[seq_len - 1:]  # next action target (T - seq_len + 1, act_dim)
         mask = torch.ones(obs_seq.shape[0], dtype=torch.bool)
@@ -132,7 +141,7 @@ def compute_weighted_masked_bc_loss(obs_padded, act_padded, weights, mask, polic
     weighted_loss = (loss_masked * weight_masked).sum() / (weight_masked.sum() +eps)
     return weighted_loss, weight_masked.sum().item()
 
-def train_weighted_bc(dataset, obs_dim, act_dim, seq_len=10, num_epochs=50, batch_size=8, lr=1e-3, policy_type="deterministic", log_dir=None, save_epoch=50):
+def train_weighted_bc(dataset, obs_dim, act_dim, seq_len=10, num_epochs=50, batch_size=8, lr=1e-3, policy_type="deterministic", log_dir=None, save_epoch=50, include_terminal_in_obs=False):
     run_name = f"Clip_BC_episodewise_{time.strftime('%Y%m%d_%H%M%S')}"
     wandb.init(project="BC_episodewise", name=run_name, config={
         "batch_size": batch_size,
@@ -142,7 +151,7 @@ def train_weighted_bc(dataset, obs_dim, act_dim, seq_len=10, num_epochs=50, batc
     
     if seq_len is not None and seq_len > 1:
         # Use the windowed dataset if seq_len is specified
-        collate_function = partial(collate_variable_episodes_windowed, seq_len=seq_len)
+        collate_function = partial(collate_variable_episodes_windowed, seq_len=seq_len, include_terminal=include_terminal_in_obs)
     else:
         collate_function = collate_variable_episodes
 
@@ -211,19 +220,20 @@ def evaluate_imitation_policy(policy, dataset, policy_type="deterministic"):
 
 if __name__ == "__main__":
     train = True # Set to False to skip training and only evaluate
-    reload_data= True # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
+    reload_data= False # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
+    load_fixing_terminal_in_obs = True # Set to True to load the fixing terminal as an extra input dimension in the observation, False to ignore it
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
     policy_type = "stochastic"  # "stochastic" for stochastic policy, "deterministic" for MLPPolicy
     train_epochs = 50
     learning_rate = 1e-3
     batch_size = 1
-    seq_window_len = 10  # sequence length for the episode window dataset
+    seq_window_len = 30  # sequence length for the episode window dataset. Corresponding number of control loops: seq_window_len*update_step
 
     '''prepare the dataset'''
 
-    dataset_base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/off_policy_2/"
-    return_function = effort_based_return_function  # or effort_based_return_function
-    dataset = load_trajectories(dataset_base_dir, return_function, env_step=update_step, reload_data=reload_data) # observation (B, D)
+    dataset_base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/off_policy_3/"
+    return_function = effort_and_energy_based_return_function  # or effort_based_return_function
+    dataset = load_trajectories(dataset_base_dir, return_function, env_step=update_step, reload_data=reload_data, load_terminal_in_obs=load_fixing_terminal_in_obs) # observation (B, D)
     # seq_dataset =  EpisodeWindowDataset(dataset, seq_len=seq_window_len)  # observation (B,T,D)
     
     # if seq_window_len is None or seq_window_len <= 1:
@@ -240,6 +250,8 @@ if __name__ == "__main__":
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
     obs_dim = dataset[0][0].shape[1]
+    if load_fixing_terminal_in_obs:
+        obs_dim += 1
     act_dim = dataset[0][1].shape[1]
 
     print(f"Training using dataset with {dataset.__len__()} episodes, "
@@ -273,10 +285,11 @@ if __name__ == "__main__":
                                 lr=learning_rate,
                                 policy_type=policy_type,
                                 log_dir=log_dir,
-                                save_epoch=50
+                                save_epoch=50,
+                                include_terminal_in_obs=load_fixing_terminal_in_obs
                             )
     else:
-        log_stored_folder = "20250709_141454" #20250629_170553 #20250702_160901 20250707_215329
+        log_stored_folder = "20250727_182152" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934
         log_dir = os.path.join(log_base_dir, log_stored_folder)
 
     policy_path = os.path.join(log_dir, "trained_BC_policy.pth")
@@ -304,7 +317,13 @@ if __name__ == "__main__":
     reload_policy.eval()
     # offline imitation evaluation
     with torch.no_grad():
-         for idx, (obs_seq, act_seq, weight) in enumerate(val_dataset):  # obs_seq: (T, obs_dim)
+         for idx, item in enumerate(val_dataset):  # obs_seq: (T, obs_dim)
+            if load_fixing_terminal_in_obs:
+                obs_seq, act_seq, weight, terminals = item
+                terminals = terminals.view(-1, 1)                    # (T, 1)
+                obs_seq = torch.cat([obs_seq, terminals], dim=-1)    
+            else:
+                obs_seq, act_seq, weight = item
             # # evaluate the policy episode-wise
             # pred_seq = reload_policy(obs_seq)  # (T, act_dim), works for MLP
             # mse = F.mse_loss(pred_seq, act_seq).item()
@@ -345,12 +364,25 @@ if __name__ == "__main__":
             axs[0].plot(range(T), obs_seq[seq_window_len:, 0].cpu().numpy(), label="Obs", color="green")
             axs[0].plot(range(T), act_seq[seq_window_len:, 0].cpu().numpy(), label="Demo_act", color="red")
             axs[0].plot(range(T), pred_seq[:, 0].cpu().numpy(), label="Pred", color="red", linestyle="--")
+            if load_fixing_terminal_in_obs:
+                # plot the terminal flag
+                # Plot terminal flag as background fill
+                terminal_flags = obs_seq[seq_window_len:, -1].cpu().numpy()  # Extract terminal flags
+                for i in range(len(terminal_flags)):
+                    if terminal_flags[i]:  # If terminal flag is True
+                        axs[0].axvspan(i - 0.5, i + 0.5, color="gray", alpha=0.2, label="Terminal" if i == 0 else None)
             axs[0].set_ylabel(f"Stretch")
             axs[0].legend()
 
             axs[1].plot(range(T), obs_seq[seq_window_len:, 3].cpu().numpy(), label="Obs", color="green")
             axs[1].plot(range(T), act_seq[seq_window_len:, 1].cpu().numpy(), label="Demo_act", color="red")
             axs[1].plot(range(T), pred_seq[:, 1].cpu().numpy(), label="Pred", color="red", linestyle="--")
+            if load_fixing_terminal_in_obs:
+                # plot the terminal flag
+                terminal_flags = obs_seq[seq_window_len:, -1].cpu().numpy()
+                for i in range(len(terminal_flags)):
+                    if terminal_flags[i]:
+                        axs[1].axvspan(i - 0.5, i + 0.5, color="gray", alpha=0.2, label="Terminal" if i == 0 else None)
             axs[1].set_ylabel(f"PUsh")
             axs[1].legend()
 
