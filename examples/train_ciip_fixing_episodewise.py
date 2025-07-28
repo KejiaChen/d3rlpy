@@ -171,6 +171,10 @@ def train_weighted_bc(dataset, obs_dim, act_dim, seq_len=10, num_epochs=50, batc
         raise ValueError(f"Unknown policy type: {policy_type}. Use 'stochastic' or 'deterministic'.")
     optimizer = optim.Adam(policy.parameters(), lr=lr)
 
+    # Early stopping variables
+    best_loss = float('inf')  # Initialize best loss to infinity
+    patience_counter = 0      # Counter for early stopping
+
     for epoch in range(num_epochs):
         epoch_loss = 0.0
 
@@ -187,6 +191,24 @@ def train_weighted_bc(dataset, obs_dim, act_dim, seq_len=10, num_epochs=50, batc
         avg_loss = epoch_loss / max(total_weight, 1e-8)
         print(f"Epoch {epoch}: Epoch loss {epoch_loss:.4f}, Weighted Avg Loss = {avg_loss:.4f}")
         wandb.log({"epoch": epoch, "weighted_bc_loss": avg_loss})
+
+        # Early stopping logic
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            patience_counter = 0  # Reset patience counter
+            # Save the best model
+            if log_dir:
+                best_model_path = os.path.join(log_dir, "best_policy.pth")
+                torch.save(policy.state_dict(), best_model_path)
+                print(f"Best model saved at epoch {epoch} with loss {best_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epochs (best loss: {best_loss:.4f})")
+
+        # Check if patience is exceeded
+        if patience_counter >= 5:
+            print(f"Early stopping triggered at epoch {epoch}. Best loss: {best_loss:.4f}")
+            break
 
         if epoch % save_epoch == 0:
             if log_dir:
@@ -220,11 +242,11 @@ def evaluate_imitation_policy(policy, dataset, policy_type="deterministic"):
 
 if __name__ == "__main__":
     train = True # Set to False to skip training and only evaluate
-    reload_data= False # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
+    reload_data= False  # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
     load_fixing_terminal_in_obs = True # Set to True to load the fixing terminal as an extra input dimension in the observation, False to ignore it
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
     policy_type = "stochastic"  # "stochastic" for stochastic policy, "deterministic" for MLPPolicy
-    train_epochs = 50
+    train_epochs = 100
     learning_rate = 1e-3
     batch_size = 1
     seq_window_len = 30  # sequence length for the episode window dataset. Corresponding number of control loops: seq_window_len*update_step

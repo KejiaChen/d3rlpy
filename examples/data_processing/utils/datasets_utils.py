@@ -165,7 +165,7 @@ class Dataloader:
         cnt = 0
         for info in info_config['label']:
             for axis in info_config['legend']:
-                print("loading",info+axis)
+                # print("loading",info+axis)
                 record = record_array[:,cnt]
                 if filter_config is not None:
                     print("smooth data with %s window of %s size when loading" %(filter_config['window'], str(filter_config['window_len'])))
