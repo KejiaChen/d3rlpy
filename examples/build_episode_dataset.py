@@ -12,11 +12,126 @@ import torch
 
 ONLINE_SOURCES = {"ForceControl":["f_ext", "dx", "f_ext_sensor", "ff", "x"]}
 
-def compute_average_reference_values(base_dir, env_step=5):
+def compute_average_reference_values(group_references):
     stretch_forces, stretch_effort, stretch_energy, push_forces, push_effort, push_energy, deformation_values, durations = [], [], [], [], [], [], [], []
-    dt = 0.001*env_step  # each env_step is 1 ms
+    for key, ref_values in group_references.items():
+        stretch_forces.append(ref_values["ref_stretch_force"])
+        stretch_effort.append(ref_values["ref_stretch_effort"])
+        stretch_energy.append(ref_values["ref_stretch_energy"])
+        push_forces.append(ref_values["ref_push_force"])
+        push_effort.append(ref_values["ref_push_effort"])
+        push_energy.append(ref_values["ref_push_energy"])
+        deformation_values.append(ref_values["ref_deformation"])
+        durations.append(ref_values["ref_duration"])
 
-    for traj_dir in sorted(os.listdir(base_dir)):
+    average_ref_values = {
+        "ref_stretch_force": np.mean(stretch_forces),
+        "ref_stretch_effort": np.mean(stretch_effort),
+        "ref_stretch_energy": np.mean(stretch_energy),
+        "ref_push_force": np.mean(push_forces),
+        "ref_push_effort": np.mean(push_effort),
+        "ref_push_energy": np.mean(push_energy),
+        "ref_deformation": np.mean(deformation_values),
+        "ref_duration": np.mean(durations),
+        "dt": group_references[list(group_references.keys())[0]]["dt"]  # assuming all groups have the same dt
+    }
+
+    return average_ref_values
+
+def compute_group_typed_reference_values(base_dir, env_step=5):
+    grouped_refs = {}
+    grouped_trajs = {}
+
+    # stretch_forces, stretch_effort, stretch_energy, push_forces, push_effort, push_energy, deformation_values, durations = [], [], [], [], [], [], [], []
+    # group_trajs = []
+    dt = 0.001*env_step  # each env_step is 1 ms
+    
+    traj_dirs = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))])
+
+    for idx, traj_dir in enumerate(traj_dirs):
+        traj_path = os.path.join(base_dir, traj_dir)
+        if not os.path.isdir(traj_path):
+            continue
+        
+        for mios_dir in sorted(os.listdir(traj_path)):
+            mios_traj_dir = os.path.join(traj_path, mios_dir)
+            if not os.path.isdir(mios_traj_dir):
+                continue
+
+            parameters = json.load(open(os.path.join(mios_traj_dir, "parameters.json"), 'r'))
+            cable_id = parameters.get("cable_id", None)
+            clip_id = parameters.get("clip_id", None)
+            fixing_pose_name = parameters.get("fixing_pose_name", None)
+            fixing_pose_id = fixing_pose_name.split("_")[-1] if fixing_pose_name else None
+            if cable_id is None or clip_id is None:
+                print(f"\033[91mSkipping {mios_traj_dir} due to missing cable_id or clip_id.\033[0m")
+                continue
+
+            group_key = f"{cable_id}_{clip_id}_pose_{fixing_pose_id}" if fixing_pose_id else f"{cable_id}_{clip_id}"
+
+            if group_key not in grouped_trajs:
+                grouped_trajs[group_key] = {
+                    "stretch_forces": [],
+                    "stretch_effort": [],
+                    "stretch_energy": [],
+                    "push_forces": [],
+                    "push_effort": [],
+                    "push_energy": [],
+                    "deformation_values": [],
+                    "durations": [],
+                }
+                grouped_refs[group_key] = {"dirs": [],
+                                           "refs": {}}
+
+            obs_raw = np.loadtxt(os.path.join(traj_path, "observations.txt"))
+            obs = preprocess_observation(obs_raw, env_step=env_step)
+
+            if obs.shape[0] == 0:
+                continue  # skip empty
+
+            grouped_trajs[group_key]["stretch_forces"].append(np.max(np.abs(obs[:, 0])))
+            grouped_trajs[group_key]["stretch_effort"].append(np.sum(np.abs(obs[:, 0])) * dt)
+            grouped_trajs[group_key]["stretch_energy"].append(utils_integral(obs[:, 0], obs[:, 1]))
+            grouped_trajs[group_key]["push_forces"].append(np.max(np.abs(obs[:, 3])))
+            grouped_trajs[group_key]["push_effort"].append(np.sum(np.abs(obs[:, 3])) * dt)
+            grouped_trajs[group_key]["push_energy"].append(utils_integral(obs[:, 3], obs[:, 4]))
+            grouped_trajs[group_key]["deformation_values"].append(np.max(np.abs(obs[:, 4])))
+            grouped_trajs[group_key]["durations"].append(obs.shape[0])
+
+            grouped_refs[group_key]["dirs"].append(int(traj_dir))
+
+    # Once we hit a group boundary or end of data, save the group's reference stats
+    for group_key, group_traj in grouped_trajs.items():
+        ref_values = {
+            "ref_stretch_force": np.mean(group_traj["stretch_forces"]),
+            "ref_stretch_effort": np.mean(group_traj["stretch_effort"]),
+            "ref_stretch_energy": np.mean(group_traj["stretch_energy"]),
+            "ref_push_force": np.mean(group_traj["push_forces"]),
+            "ref_push_effort": np.mean(group_traj["push_effort"]),
+            "ref_push_energy": np.mean(group_traj["push_energy"]),
+            "ref_deformation": np.mean(group_traj["deformation_values"]),
+            "ref_duration": np.mean(group_traj["durations"]),
+            "dt": dt
+        }
+
+        grouped_refs[group_key]["refs"] = ref_values
+
+        print(f"\033[92mComputed {len(grouped_refs[group_key]['dirs'])} reference values from demos of config type {group_key}: {ref_values}\033[0m")
+
+    return grouped_refs
+
+
+def compute_group_sized_reference_values(base_dir, env_step=5, group_size=30):
+    grouped_refs = {}
+    group_key = 0
+
+    stretch_forces, stretch_effort, stretch_energy, push_forces, push_effort, push_energy, deformation_values, durations = [], [], [], [], [], [], [], []
+    group_trajs = []
+    dt = 0.001*env_step  # each env_step is 1 ms
+    
+    traj_dirs = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))])
+
+    for idx, traj_dir in enumerate(traj_dirs):
         traj_path = os.path.join(base_dir, traj_dir)
         if not os.path.isdir(traj_path):
             continue
@@ -36,20 +151,44 @@ def compute_average_reference_values(base_dir, env_step=5):
         deformation_values.append(np.max(np.abs(obs[:, 4])))
         durations.append(obs.shape[0])
 
-    ref_values = {
-        "ref_stretch_force": np.mean(stretch_forces),
-        "ref_stretch_effort": np.mean(stretch_effort),
-        "ref_stretch_energy": np.mean(stretch_energy),
-        "ref_push_force": np.mean(push_forces),
-        "ref_push_effort": np.mean(push_effort),
-        "ref_push_energy": np.mean(push_energy),
-        "ref_deformation": np.mean(deformation_values),
-        "ref_duration": np.mean(durations),
-        "dt": dt
-    }
+        group_trajs.append(traj_dir)
 
-    print(f"\033[92mComputed reference values from demos: {ref_values}\033[0m")
-    return ref_values
+        # Once we hit a group boundary or end of data, save the group's reference stats
+        if len(group_trajs) >= 2:
+            if (int(group_trajs[-1])-int(group_trajs[0])+1) % group_size == 0 or (idx + 1) == len(traj_dirs): # group_trajs might not be continuous, as we delete some trajectories manually
+                ref_values = {
+                    "ref_stretch_force": np.mean(stretch_forces),
+                    "ref_stretch_effort": np.mean(stretch_effort),
+                    "ref_stretch_energy": np.mean(stretch_energy),
+                    "ref_push_force": np.mean(push_forces),
+                    "ref_push_effort": np.mean(push_effort),
+                    "ref_push_energy": np.mean(push_energy),
+                    "ref_deformation": np.mean(deformation_values),
+                    "ref_duration": np.mean(durations),
+                    "dt": dt
+                }
+
+                grouped_refs[group_key] = {"dirs": [], "refs": {}}
+                grouped_refs[group_key]["dirs"] = group_trajs
+                grouped_refs[group_key]["refs"] = ref_values
+
+                print(f"\033[92mComputed {len(grouped_refs)} reference values from demos {group_trajs[0]} to {group_trajs[-1]}: {ref_values}\033[0m")
+
+                # Reset for next group
+                stretch_forces.clear()
+                stretch_effort.clear()
+                stretch_energy.clear()
+                push_forces.clear()
+                push_effort.clear()
+                push_energy.clear()
+                deformation_values.clear()
+                durations.clear()
+
+                group_trajs.clear()   
+
+                group_key += 1
+
+    return grouped_refs
 
 
 def check_success(traj_path, obs_buffer, acts_buffer):
@@ -195,7 +334,7 @@ def preprocess_observation(obs_buffer, env_step=5):
         push_velocity,
     ], axis=1)
 
-def load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw):
+def load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw, fixing_success):
     data_loader = Dataloader(disabe_filter=True) # for real-time analysis, filters have to be disabled
     # start to contact
     sorted_record = data_loader.load_one_trail(sources=ONLINE_SOURCES,
@@ -208,11 +347,11 @@ def load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_
     end_index = -(10*1000 - post_finish_steps)  # 10 seconds before the end
 
     # pushing
-    external_force_y = sorted_record["ForceControl"]['Force']["proj"][:post_finish_steps]
-    external_force_y_sensor = sorted_record["ForceControl"]['Force_sensor']["proj"][:post_finish_steps]
+    external_force_y = sorted_record["ForceControl"]['Force']["proj"]
+    external_force_y_sensor = sorted_record["ForceControl"]['Force_sensor']["proj"]
     feedforward_force_y = np.zeros_like(external_force_y_sensor)
-    linear_velocity_y = sorted_record["ForceControl"]['LinearVelocity']["proj"][:post_finish_steps]
-    distance_y = sorted_record["ForceControl"]['Distance']["proj"][:post_finish_steps]
+    linear_velocity_y = sorted_record["ForceControl"]['LinearVelocity']["proj"]
+    distance_y = sorted_record["ForceControl"]['Distance']["proj"]
 
     # stretching
     external_force_x = sorted_record["ForceControl"]['Force']["x"]
@@ -237,12 +376,11 @@ def load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_
     ], axis=1)
 
     # load fixing result
-    fixing_success = load_and_preprocess_fixing_result(os.path.join(mios_traj_dir, "fixing_result.json"))
     fixing_terminal_index = -1
     if fixing_success:
         fixing_terminal_index = data_loader.get_timestamps()["finished"] - data_loader.get_timestamps()["contacted"]
 
-    return post_obs_buffer_raw, post_acts_buffer_raw, fixing_success, fixing_terminal_index
+    return post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index
 
 def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformation_in_return=True, return_fn=None, return_kwargs=None):
     base_dir = os.path.dirname(traj_path)
@@ -250,32 +388,41 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
 
     obs_buffer_raw = np.loadtxt(os.path.join(traj_path, "observations.txt"))  # the last column is supposed to be the terminal, but was not stored correctly in the past
     acts_buffer_raw = np.loadtxt(os.path.join(traj_path, "actions.txt"))
-    
-    for mios_dir in sorted(os.listdir(traj_path)): # load from raw mios logs
+
+    print(f"Loaded fixing observation with {obs_buffer_raw.shape[0]} steps.")
+
+    for mios_dir in sorted(os.listdir(traj_path)): # load from raw mios logs when post sensing is not stored correctly in policy log
         mios_traj_dir = os.path.join(traj_path, mios_dir)
         if not os.path.isdir(mios_traj_dir):
             continue
         else:
-            post_obs_buffer_raw, post_acts_buffer_raw, fixing_success, fixing_terminal_index = load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw)
-            if fixing_terminal_index != -1:
-                fixing_terminal_index = fixing_terminal_index - 30 # Assuming 10 steps were used for communication latency
-    
-    print(f"Loaded fixing observation with {obs_buffer_raw.shape[0]} steps.")
+            fixing_success = load_and_preprocess_fixing_result(os.path.join(mios_traj_dir, "fixing_result.json"))
 
-    if post_sensing:
-        obs_buffer_raw = np.concatenate([obs_buffer_raw[:, :6], post_obs_buffer_raw], axis=0)
-        acts_buffer_raw = np.concatenate([acts_buffer_raw, post_acts_buffer_raw], axis=0)
-    
-    terminals_raw = load_and_preprocess_terminal(traj_path, obs_buffer_raw, acts_buffer_raw, fixing_terminal_index)
-    
+            if post_sensing:
+                post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index = load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw, fixing_success)
+                if fixing_terminal_index != -1:
+                    fixing_terminal_index = fixing_terminal_index - 30 # Assuming 10 steps were used for communication latency
+
+                obs_buffer_raw = np.concatenate([obs_buffer_raw[:, :6], post_obs_buffer_raw], axis=0)
+                acts_buffer_raw = np.concatenate([acts_buffer_raw, post_acts_buffer_raw], axis=0)
+
+                terminals_raw = load_and_preprocess_terminal(traj_path, obs_buffer_raw, acts_buffer_raw, fixing_terminal_index)
+            else:
+                terminals_raw = obs_buffer_raw[:, -1].astype(bool)  # last column is terminal, but was not stored correctly in the past
+                terminals_raw = terminals_raw.reshape(-1)
+
     # load from policy log and downsample
     obs_buffer_downsampled = preprocess_observation(obs_buffer_raw, env_step=env_step)
     acts_buffer_downsampled  = preprocess_action(acts_buffer_raw, env_step=env_step)
     terminals_downsampled = np.concatenate([
-                                terminals_raw[::env_step],
-                                [terminals_raw[-1]] if (terminals_raw.shape[0]) % env_step != 0 else np.empty(0, dtype=terminals_raw.dtype)
-                            ])
-    terminal_index_downsampled = fixing_terminal_index // env_step
+        terminals_raw[::env_step],
+        [terminals_raw[-1]] if (terminals_raw.shape[0]) % env_step != 0 else np.empty(0, dtype=terminals_raw.dtype)
+    ])
+    if post_sensing:
+        terminal_index_downsampled = fixing_terminal_index // env_step
+    else:
+        terminal_index_downsampled = np.where(terminals_downsampled)[0][0] if np.any(terminals_downsampled) else terminals_downsampled.shape[0] - 1
+        
     print(f"Trajectory {traj_dir} has {obs_buffer_downsampled.shape[0]} steps after downsampling.")
 
     # find start index where forces only rise
@@ -287,7 +434,7 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
 
     print(f"Trajectory {traj_dir} starts from index {start_index} after stable start index detection")
     
-    # calculate reward
+    # calculate reward only BEFORE the terminal index
     # ep_return = return_function(obs_buffer, ref_stretch_force=10.0, ref_push_force=5.0, ref_deformation=0.005, ref_duration=500)
     if return_fn is not None:
         if return_kwargs is None:
@@ -316,7 +463,7 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
     if not reload_data and os.path.exists(os.path.join(base_dir, "episode_dataset.npz")):
         print(f"Loading existing episode dataset from {os.path.join(base_dir, 'episode_dataset.npz')}")
         data = np.load(os.path.join(base_dir, "episode_dataset.npz"), allow_pickle=True)
-        ref_values = json.load(open(os.path.join(base_dir, "reference_values.json"), 'r'))
+        grouped_ref_values = json.load(open(os.path.join(base_dir, "reference_values.json"), 'r'))
         return EpisodeDataset(
             observations=data["observations"],
             actions=data["actions"],
@@ -326,10 +473,10 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
         )
     else:
         # === Step 1: compute reference values across all episodes ===
-        ref_values = compute_average_reference_values(base_dir, env_step=env_step)
+        grouped_ref_values = compute_group_sized_reference_values(base_dir, env_step=env_step)
         # save as json
         with open(os.path.join(base_dir, "reference_values.json"), 'w') as f:
-            json.dump(ref_values, f, indent=4)
+            json.dump(grouped_ref_values, f, indent=4)
 
         all_observations = []
         all_actions = []
@@ -340,11 +487,25 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
             traj_path = os.path.join(base_dir, traj_dir)
             if not os.path.isdir(traj_path):  # Skip files like "episode_dataset.npz"
                 continue
-            obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_result = load_one_episode(traj_path, 
-                                                                                                           env_step=env_step,
-                                                                                                           return_fn=return_function,
-                                                                                                           return_kwargs=ref_values)
             
+            # get reference values for this trajectory
+            traj_ref_values = {}
+            for group_key, ref_values in grouped_ref_values.items():
+                if int(traj_dir) in ref_values["dirs"]:
+                    traj_ref_values = ref_values["refs"].copy()
+                    break
+
+            obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_result = load_one_episode(traj_path, 
+                                                                                                    env_step=env_step,
+                                                                                                    post_sensing=True,
+                                                                                                    include_deformation_in_return=True,
+                                                                                                    return_fn=return_function,
+                                                                                                    return_kwargs=traj_ref_values)
+            
+            # filter out outliers with flat curves
+            if np.max(obs_buffer[:, 3]) - obs_buffer[0, 3] < 3:
+                print(f"\033[91mSkipping trajectory {traj_dir} due to flat pushing with difference {np.max(obs_buffer[:, 3]) - obs_buffer[0, 3]}.\033[0m")
+                continue
             
             all_observations.append(obs_buffer)
             all_actions.append(acts_buffer)
