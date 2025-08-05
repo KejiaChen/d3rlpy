@@ -9,6 +9,35 @@ from return_functions import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def export_encoder_to_onnx(encoder, export_path="dynamics_encoder.onnx"):
+    encoder.eval()
+    B, T, D = 1, 100, 6  # batch size 1, time steps 100, input dim 6
+    x_dummy = torch.randn(B, T, D)
+    lengths_dummy = torch.tensor([T])  # full length sequence
+    x_dummy, lengths_dummy = x_dummy.to(device), lengths_dummy.to(device)
+    
+    torch.onnx.export(
+        encoder,
+        (x_dummy, lengths_dummy),
+        export_path,
+        export_params=True,
+        opset_version=11,
+        input_names=["input", "lengths"],
+        output_names=["z_dyn"],
+        # Remove dynamic_axes for batch_size
+        dynamic_axes={
+            "input": {1: "time_steps"},
+            "z_dyn": {0: "batch_size"}
+        }
+    )
+    print(f"ONNX model exported to {export_path}")
+
+def masked_mse(pred, target, mask):
+    mse = (pred - target) ** 2
+    mse = mse.sum(dim=-1)
+    mse = mse * mask
+    return mse.sum() / mask.sum().clamp(min=1)
+
 # --- GRU Encoder for z_dyn ---
 # (f_i, x_i, v_i)-> z_dyn
 class DynamicsRNNEncoder(nn.Module):
@@ -16,10 +45,19 @@ class DynamicsRNNEncoder(nn.Module):
         super().__init__()
         self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
         self.fc = nn.Linear(hidden_dim, z_dim)
+        self.exporting = False  # Flag to control ONNX export
+
+    def set_export(self, export: bool):
+        self.exporting = export
 
     def forward(self, x, lengths):  # x: (B, T, input_dim)
-        packed = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        _, h_n = self.gru(packed)
+        if self.exporting:
+            # ONNX can't handle pack_padded_sequence; fallback to regular GRU
+            output, _ = self.gru(x)
+            h_n = output[:, -1, :]  # take last hidden state manually
+        else:
+            packed = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            _, h_n = self.gru(packed)
         return self.fc(h_n.squeeze(0))  # (B, z_dim)
 
 # --- Decoder: reconstruct full sequence ---
