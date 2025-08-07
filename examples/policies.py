@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.distributions as D
 
 
-def export_policy_to_onnx(policy, obs_dim, seq_len, z_dim, policy_type, export_path="mlp_policy.onnx"):
+def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic", export_path="mlp_policy.onnx", step_wise=False):
     policy.eval()
     if seq_len is not None and seq_len > 1:
         dummy_input = torch.randn(1, 1, seq_len, obs_dim)
@@ -20,25 +20,52 @@ def export_policy_to_onnx(policy, obs_dim, seq_len, z_dim, policy_type, export_p
             "output": {0: "batch_size"}
         }
     )
-    elif policy_type == "gru_with_encoder":
-        dummy_input = torch.randn(1, 1, obs_dim)
-        dummy_z_dyn = torch.randn(1, z_dim)               # (B, z_dim)
+    elif policy_type == "gru_with_encoder" or policy_type == "gru_no_encoder":
+        if step_wise:
+            dummy_input = torch.randn(1, obs_dim)
+            dummy_z_dyn = torch.randn(1, policy.get_z_dim())    # (B, z_dim)
+            dummy_h = torch.zeros(1, 1, policy.get_hidden_dim())
 
-        dummy_input, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
+            dummy_input, dummy_z_dyn, dummy_h = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device), dummy_h.to(next(policy.parameters()).device)
 
-        torch.onnx.export(
-        policy,
-        (dummy_input, dummy_z_dyn),  # Tuple of inputs
-        export_path,
-        export_params=True,
-        opset_version=11,
-        input_names=["obs_seq", "z_dyn"],
-        output_names=["output"],
-        dynamic_axes={
-            "obs_seq": {0: "batch_size", 1: "time_steps"},
-            "z_dyn": {0: "batch_size"},
-            "output": {0: "batch_size", 1: "time_steps"},
-        }
+            torch.onnx.export(
+            policy,
+            (dummy_input, dummy_z_dyn, dummy_h),  # Tuple of inputs
+            export_path,
+            export_params=True,
+            opset_version=11,
+            input_names=["obs_seq", "z_dyn", "h_in"],
+            output_names=["output", "h_out"],
+            dynamic_axes={
+                "obs_seq": {0: "batch_size"},
+                "z_dyn": {0: "batch_size"},
+                "h_in": {0: "batch_size"},
+                "output": {0: "batch_size"},
+                "h_out": {0: "batch_size"},
+            },
+        )
+        else:
+            dummy_input = torch.randn(1, 1, obs_dim)
+            dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())               # (B, 1, z_dim)
+            dummy_h   = torch.zeros(1, 1, policy.get_hidden_dim())
+
+            dummy_input, dummy_z_dyn, dummy_h = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device), dummy_h.to(next(policy.parameters()).device)
+
+            torch.onnx.export(
+            policy,
+            (dummy_input, dummy_z_dyn, dummy_h),  # Tuple of inputs
+            export_path,
+            export_params=True,
+            opset_version=11,
+            input_names=["obs_seq", "z_dyn", "h_in"],
+            output_names=["output", "h_out"],
+            dynamic_axes={
+                "obs_seq": {0: "batch_size"},
+                "z_dyn": {0: "batch_size"},
+                "h_in": {1: "batch_size"},
+                "output": {0: "batch_size"},
+                "h_out": {1: "batch_size"},
+            }
     )
     else:
         dummy_input = torch.randn(1, 1, obs_dim)  # 3D input: (batch_size, seq_len, obs_dim) to match the expected input shape in cpp
@@ -177,59 +204,104 @@ class StochasticMLPSeqPolicy(nn.Module):
 class StochasticRNNPolicy(nn.Module):
     def __init__(self, obs_dim, act_dim, z_dim=32, hidden_dim=128):
         super().__init__()
-        self.input_dim = obs_dim - 1 + z_dim
+        self.obs_dim = obs_dim
+        self.z_dim = z_dim
+        self.input_dim = self.obs_dim - 1 + self.z_dim
         self.gru = nn.GRU(self.input_dim, hidden_dim, batch_first=True)
         self.mean_head = nn.Linear(hidden_dim, act_dim)
         self.log_std = nn.Parameter(torch.zeros(act_dim))
+        self.hidden_dim = hidden_dim
 
-    def forward(self, obs_seq, z_dyn):
+    def forward(self, obs_seq, z_dyn, h=None):
         """
-        obs_seq: (B, T, obs_dim), with terminal in the last dimension
+        obs_seq: (B, T, obs_dim) where obs_dim includes terminal flag
         z_dyn:   (B, z_dim)
         """
         B, T, obs_dim = obs_seq.shape
-        h = torch.zeros(1, B, self.gru.hidden_size, device=obs_seq.device)
 
-        outputs = []
-        for t in range(T):
-            obs_t = obs_seq[:, t, :]  # (B, obs_dim)
-            terminal_mask = obs_t[:, -1] > 0.5  # assuming last dim is terminal
+        terminal = obs_seq[..., -1] > 0.5  # (B, T) boolean mask
+        obs_input = obs_seq[..., :-1]     # remove terminal flag: (B, T, obs_dim - 1)
 
-            input_t = obs_t
-            if z_dyn is not None:
-                z_dyn_exp = z_dyn  # (B, z_dim)
-                input_t = torch.cat([obs_t[:, :-1], z_dyn_exp], dim=-1)  # exclude terminal flag from input
+        # Expand z_dyn to match time dimension
+        if z_dyn is not None:
+            rnn_input = torch.cat([obs_input, z_dyn], dim=-1)  # (B, T, input_dim)
+        else:
+            rnn_input = obs_input  # (B, T, input_dim)
 
-            input_t = input_t.unsqueeze(1)  # (B, 1, input_dim)
+        if T == 1:
+            # Step-by-step inference: provide and return hidden state
+            rnn_output, new_h = self.gru(rnn_input, h)  # (B, 1, H), h: (1, B, H)
+        else:
+            # Training or full sequence inference
+            rnn_output, new_h = self.gru(rnn_input)  # (B, T, H)
 
-            # Only update GRU if not terminated
-            out_t, h = self.gru(input_t, h)
-            h[:, terminal_mask, :] = h[:, terminal_mask, :].detach() * 0  # reset hidden state where terminal = 1
+        mean = self.mean_head(rnn_output)    # (B, T, act_dim)
+        # Mask outputs after terminal to 0
+        mean = mean * (~terminal).unsqueeze(-1).float()  # (B, T, act_dim)
+        mean = torch.clamp(mean, 0.0, 30.0)
 
-            mean_t = self.mean_head(out_t.squeeze(1))
-            mean_t = torch.clamp(mean_t, 0.0, 30.0)
-            outputs.append(mean_t)
-
-        return torch.stack(outputs, dim=1)  # (B, T, act_dim)
+        if T == 1:
+            return mean.squeeze(1), new_h  # return (B, act_dim), hidden
+        else:
+            return mean  # (B, T, act_dim)
 
     def get_dist(self, obs_seq, z_dyn=None):
         mean = self.forward(obs_seq, z_dyn)  # (B, T, act_dim)
         std = torch.exp(self.log_std)        # (act_dim,)
         std = std.expand_as(mean)            # (B, T, act_dim)
         return torch.distributions.Normal(mean, std)
+    
+    def init_hidden(self, batch_size=1, device='cpu'):
+        return torch.zeros(1, batch_size, self.hidden_dim, device=device)
+    
+    def get_z_dim(self):
+        return self.z_dim
+    
+    def get_hidden_dim(self):
+        return self.hidden_dim
 
-# class ValueMLP(nn.Module):
-#     def __init__(self, obs_dim, seq_len, hidden_dims=(128, 128)):
-#         super().__init__()
-#         input_dim = obs_dim * seq_len
-#         layers = []
-#         dims = [input_dim] + list(hidden_dims)
-#         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
-#             layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
-#         self.encoder = nn.Sequential(*layers)
-#         self.value_head = nn.Linear(dims[-1], 1)
+class StochasticRNNPolicyStepwise(nn.Module):
+    def __init__(self, obs_dim, act_dim, z_dim=32, hidden_dim=128):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.z_dim = z_dim
+        self.input_dim = self.obs_dim - 1 + self.z_dim
+        self.hidden_dim = hidden_dim
 
-#     def forward(self, obs_seq):
-#         B, S, D = obs_seq.shape
-#         obs_seq = obs_seq.view(B, S * D)
-#         return self.value_head(self.encoder(obs_seq)).squeeze(-1)  # (B,)
+        self.gru = nn.GRU(self.input_dim, hidden_dim, batch_first=True)
+        self.mean_head = nn.Linear(hidden_dim, act_dim)
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+    def forward(self, obs_t, z_dyn_t, h_t):
+        terminal = obs_t[:, -1] > 0.5  # (B, T) boolean mask
+        obs_input = obs_t[:, :-1]     # remove terminal flag: (B, T, obs_dim - 1)
+
+        if z_dyn_t is not None:
+            # Concatenate obs_input and z_dyn_t
+            x = torch.cat([obs_input, z_dyn_t], dim=-1)
+        else:
+            x = obs_input
+        x = x.unsqueeze(1) # (B, 1, input_dim)
+
+        # GRU step
+        output, h_t_next = self.gru(x, h_t)          # output: (B, 1, H), h_t_next: (1, B, H)
+        last_hidden = output[:, 0, :]                # (B, hidden_dim)
+
+        # Predict mean
+        mean = self.mean_head(last_hidden)           # (B, act_dim)
+
+        return mean, h_t_next
+
+    def get_dist_step(self, obs_t, z_dyn_t, h_t):
+        mean, h_t_next = self.forward(obs_t, z_dyn_t, h_t)
+        std = torch.exp(self.log_std).expand_as(mean)
+        return torch.distributions.Normal(mean, std), h_t_next
+    
+    def init_hidden(self, batch_size=1, device='cpu'):
+        return torch.zeros(1, batch_size, self.hidden_dim, device=device)
+    
+    def get_z_dim(self):
+        return self.z_dim
+    
+    def get_hidden_dim(self):
+        return self.hidden_dim
