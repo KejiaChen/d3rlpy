@@ -7,6 +7,7 @@ import numpy as np
 from build_episode_dataset import load_trajectories
 from return_functions import *
 from dynamics_encoder_decoder import *
+from train_ciip_fixing_episodewise_rnn import get_padded_window
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -148,33 +149,21 @@ def plot_trajectory(y_batch, y_pred, lengths, traj_id, plot_dir="plots"):
 
     # Adjust layout and show the plot
     plt.tight_layout()
-    # plt.show()
+    plt.show()
     # plt_file = os.path.join(os.path.join(base_dir, traj_dir), f"{traj_dir}_force_plot.png")
     # plt.savefig(plt_file)
     plt.close(fig)
 
-    
-def evaluate_dynamics_encoder(encoder, decoder, val_loader, loss_fn, plot=False):
+
+def evaluate_dynamics_encoder(encoder, decoder, encoder_window_length, val_loader, loss_fn, plot=False, decode_using_encoder=True, decode_using_input=True):
     encoder.eval()
+    encoder.set_export(True)  # Set export mode for ONNX export if needed
     decoder.eval()
     total_loss = 0.0
     with torch.no_grad():
         for x_batch, force_only_batch, y_batch, mask, lengths, y_init in val_loader:
-            x_batch = x_batch.to(device)
-            force_only_batch = force_only_batch.to(device)
-            y_batch = y_batch.to(device)
-            mask = mask.to(device)
-            lengths = lengths.to(device)
-            y_init = y_init.to(device)  # (B, 4)
-
-            z_dyn = encoder(x_batch, lengths)           # (B, z_dim)
-
-            # y_pred = decoder(z_dyn, x_batch.size(1))    # dyn decoder
-            # y_pred = decoder(x_batch, z_dyn)            # auto dyn decoder
-            # y_pred = decoder(x_batch) # auto decoder and stepwise decoder
-            # y_pred = decoder(x_batch, y_init)
-            y_pred = decoder(force_only_batch, y_init, z_dyn)  # force-only decoder with z_dyn
-
+            y_pred, y_batch, mask = forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_batch, y_batch, mask, lengths, y_init, 
+                                                decode_using_encoder, decode_using_input)
 
             loss = loss_fn(y_pred, y_batch, mask)
             total_loss += loss.item()
@@ -187,11 +176,51 @@ def evaluate_dynamics_encoder(encoder, decoder, val_loader, loss_fn, plot=False)
     decoder.train()
     return total_loss / len(val_loader)
 
-def masked_mse(pred, target, mask):
-    mse = (pred - target) ** 2
-    mse = mse.sum(dim=-1)
-    mse = mse * mask
-    return mse.sum() / mask.sum().clamp(min=1)
+
+def forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_batch, y_batch, mask, lengths, y_init, decode_using_encoder=True, decode_using_input=True):
+    x_batch = x_batch.to(device)
+    force_only_batch = force_only_batch.to(device)
+    y_batch = y_batch.to(device)
+    mask = mask.to(device)
+    lengths = lengths.to(device)
+    y_init = y_init.to(device)  # (B, 4)
+
+    B, T, obs_dim = x_batch.size()
+
+    if encoder_window_length > 1:
+        y_pred_list = []
+        h = decoder.init_hidden(B, device=device)  # Initialize hidden state
+        y_prev = y_init
+        for t in range(T):
+            if decode_using_encoder:
+                # encoding with sliding window
+                windowed_x = get_padded_window(x_batch, t, encoder_window_length)  # (B, window_len, obs_dim)
+                z_dyn = encoder(windowed_x)
+            else:
+                z_dyn = None
+
+            if decode_using_input:
+                input_t = force_only_batch[:, t, :]  # (B, 2)
+            else:
+                input_t = None
+
+            # current_force_only_batch = current_force_only_batch.unsqueeze(1).expand(-1, 1, -1)  # (B, window_len, 2)
+            y_current, h = decoder.step(input_t, y_prev, z_dyn, h)  # force-only decoder with z_dyn
+            y_pred_list.append(y_current)
+            y_prev = y_current  # update y_prev for next step
+
+        y_pred = torch.stack(y_pred_list, dim=1)  # (B, T, 4)
+    else:
+        # z_dyn = encoder(x_batch, lengths)          # (B, z_dim)
+        z_dyn = encoder(x_batch, mask)           # (B, z_dim)
+
+        # y_pred = decoder(z_dyn, x_batch.size(1))    # dyn decoder
+        # y_pred = decoder(x_batch, z_dyn)            # auto dyn decoder
+        # y_pred = decoder(x_batch) # auto decoder and stepwise decoder
+        # y_pred = decoder(force_only_batch, y_init)
+        y_pred = decoder(force_only_batch, y_init, z_dyn)  # force-only decoder with z_dyn
+
+    return y_pred, y_batch, mask
 
 # --- Training loop ---
 if __name__ == "__main__":
@@ -202,13 +231,24 @@ if __name__ == "__main__":
     encoder_input_dim = 6
     decoder_input_dim = 2
     output_dim = 4
+    encoder_window_length = 50  # 1 for stepwise, >1 for windowed
+    z_dim = 16
+    hidden_dim = 64
+
+    decode_using_encoder = True # Set to False to skip encoder training
+    if not decode_using_encoder:
+        z_dim = 0  # No z_dim if not using encoder
+    decode_using_input = False  # Set to True to use input as decoder
+    if not decode_using_input:
+        decoder_input_dim = 0
 
     dataset_base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/off_policy_4/"
     return_function = effort_and_energy_based_return_function  # effort_and_energy_based_return_function or effort_based_return_function
     dataset = load_trajectories(dataset_base_dir, return_function, env_step=update_step, reload_data=reload_data, load_terminal_in_obs=load_fixing_terminal_in_obs) # observation (B, D)
     
-    encoder_save_path = "best_encoder_2.pth"
-    decoder_save_path = "best_decoder_2.pth"
+    encoding_save_dir = "/home/tp2/Documents/kejia/d3rlpy/d3rlpy_logs/Dynamics_Encoder"
+    encoder_save_path = os.path.join(encoding_save_dir, f"best_encoder_2_encoding_{decode_using_encoder}_input_{decode_using_input}.pth")
+    decoder_save_path = os.path.join(encoding_save_dir, f"best_decoder_2_encoding_{decode_using_encoder}_input_{decode_using_input}.pth")
 
     from torch.utils.data import random_split   
     # 80% train, 20% validation
@@ -223,16 +263,17 @@ if __name__ == "__main__":
 
     '''Training'''
     if train:
-        encoder = DynamicsRNNEncoder(input_dim=encoder_input_dim).to(device)
-        dyn_decoder = DynamicsDecoder(z_dim=32, output_dim=output_dim, max_len=2000).to(device)  # <-- increased max_len
-        auto_dyn_decoder = AutoregressiveDynamicsDecoder(input_dim=decoder_input_dim, z_dim=32, output_dim=output_dim).to(device)
+        encoder = DynamicsRNNEncoder(input_dim=encoder_input_dim, z_dim=z_dim, hidden_dim=hidden_dim, use_mask=True).to(device)
+        dyn_decoder = DynamicsDecoder(z_dim=z_dim, output_dim=output_dim, max_len=2000).to(device)  # <-- increased max_len
+        auto_dyn_decoder = AutoregressiveDynamicsDecoder(input_dim=decoder_input_dim, z_dim=z_dim, output_dim=output_dim).to(device)
         auto_decoder = AutoregressiveVanillaDecoder(input_dim=decoder_input_dim, output_dim=output_dim).to(device)
         step_decoder = StepwiseVanillaDecoder(input_dim=decoder_input_dim, output_dim=output_dim).to(device)
         force_only_decoder_fc = ForceOnlyVanillaDecoderFC(input_dim=decoder_input_dim, state_dim=output_dim, output_dim=output_dim).to(device)
         force_only_decoder_rnn = ForceOnlyVanillaDecoderRNN(input_dim=decoder_input_dim, state_dim=output_dim, output_dim=output_dim).to(device)
-        force_only_dyn_decoder_fc = ForceOnlyDynamicsDecoderFc(input_dim=decoder_input_dim, z_dim=32, state_dim=output_dim,  output_dim=output_dim).to(device)
-        force_only_dyn_decoder_rnn = ForceOnlyDynamicsDecoderRNN(input_dim=decoder_input_dim, z_dim=32, state_dim=output_dim, output_dim=output_dim).to(device)
-        decoder = force_only_dyn_decoder_rnn
+        force_only_dyn_decoder_fc = ForceOnlyDynamicsDecoderFc(input_dim=decoder_input_dim, z_dim=z_dim, state_dim=output_dim,  output_dim=output_dim).to(device)
+        force_only_dyn_decoder_rnn = ForceOnlyDynamicsDecoderRNN(input_dim=decoder_input_dim, z_dim=z_dim, state_dim=output_dim, output_dim=output_dim).to(device)
+        flexible_decoder = FlexibleDynamicsDecoderRNN(input_dim=decoder_input_dim, z_dim=z_dim, state_dim=output_dim, output_dim=output_dim).to(device)
+        decoder = flexible_decoder
 
         encoder.train()
         decoder.train()
@@ -241,23 +282,11 @@ if __name__ == "__main__":
 
         best_loss = float('inf')
         patience_counter = 0
-        for epoch in range(100):
+        for epoch in range(200):
             total_loss = 0
             for x_batch, force_only_batch, y_batch, mask, lengths, y_init in train_dataloader:
-                x_batch = x_batch.to(device)
-                force_only_batch = force_only_batch.to(device)
-                y_batch = y_batch.to(device)
-                mask = mask.to(device)
-                lengths = lengths.to(device)
-                y_init = y_init.to(device)  # (B, 4)
 
-                z_dyn = encoder(x_batch, lengths)          # (B, z_dim)
-
-                # y_pred = decoder(z_dyn, x_batch.size(1))    # dyn decoder
-                # y_pred = decoder(x_batch, z_dyn)            # auto dyn decoder
-                # y_pred = decoder(x_batch) # auto decoder and stepwise decoder
-                # y_pred = decoder(force_only_batch, y_init)
-                y_pred = decoder(force_only_batch, y_init, z_dyn)  # force-only decoder with z_dyn
+                y_pred, y_batch, mask = forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_batch, y_batch, mask, lengths, y_init, decode_using_encoder, decode_using_input)
 
                 loss = loss_fn(y_pred, y_batch, mask)
 
@@ -267,7 +296,7 @@ if __name__ == "__main__":
 
                 total_loss += loss.item()
             
-            val_loss = evaluate_dynamics_encoder(encoder, decoder, val_dataloader, loss_fn)
+            val_loss = evaluate_dynamics_encoder(encoder, decoder, encoder_window_length, val_dataloader, loss_fn, plot=False, decode_using_encoder=decode_using_encoder, decode_using_input=decode_using_input)
 
             if val_loss < best_loss:
                 best_loss = val_loss
@@ -277,27 +306,28 @@ if __name__ == "__main__":
             else:
                 patience_counter += 1
 
-            if patience_counter >= 20:
+            if patience_counter >= 5:
                 print(f"Early stopping at epoch {epoch+1}, no improvement for 10 epochs.")
                 break
 
             print(f"Epoch {epoch+1:02d} | Train Loss: {total_loss / len(train_dataloader):.4f} | Val Loss: {val_loss:.4f}")
 
     '''Evaluation'''
-    eval_encoder = DynamicsRNNEncoder(input_dim=encoder_input_dim).to(device)
-    eval_dyn_decoder = DynamicsDecoder(z_dim=32, output_dim=output_dim, max_len=2000).to(device)  # <-- increased max_len
-    eval_auto_dyn_decoder = AutoregressiveDynamicsDecoder(input_dim=decoder_input_dim, z_dim=32, output_dim=output_dim).to(device)
+    eval_encoder = DynamicsRNNEncoder(input_dim=encoder_input_dim, z_dim=z_dim, hidden_dim=hidden_dim, use_mask=True).to(device)
+    eval_dyn_decoder = DynamicsDecoder(z_dim=z_dim, output_dim=output_dim, max_len=2000).to(device)  # <-- increased max_len
+    eval_auto_dyn_decoder = AutoregressiveDynamicsDecoder(input_dim=decoder_input_dim, z_dim=z_dim, output_dim=output_dim).to(device)
     eval_auto_decoder = AutoregressiveVanillaDecoder(input_dim=decoder_input_dim, output_dim=output_dim).to(device)
     eval_step_encoder = StepwiseVanillaDecoder(input_dim=decoder_input_dim, output_dim=output_dim).to(device)
     eval_force_only_decoder_fc = ForceOnlyVanillaDecoderFC(input_dim=decoder_input_dim, state_dim=output_dim, output_dim=output_dim).to(device)
     eval_force_only_decoder_rnn = ForceOnlyVanillaDecoderRNN(input_dim=decoder_input_dim, state_dim=output_dim, output_dim=output_dim).to(device)
-    eval_force_only_dyn_decoder_fc = ForceOnlyDynamicsDecoderFc(input_dim=decoder_input_dim, z_dim=32, state_dim=output_dim, output_dim=output_dim).to(device)
-    eval_force_only_dyn_decoder_rnn = ForceOnlyDynamicsDecoderRNN(input_dim=decoder_input_dim, z_dim=32, state_dim=output_dim, output_dim=output_dim).to(device)
-    eval_decoder = eval_force_only_dyn_decoder_rnn  # Use the force-only decoder for evaluation
+    eval_force_only_dyn_decoder_fc = ForceOnlyDynamicsDecoderFc(input_dim=decoder_input_dim, z_dim=z_dim, state_dim=output_dim, output_dim=output_dim).to(device)
+    eval_force_only_dyn_decoder_rnn = ForceOnlyDynamicsDecoderRNN(input_dim=decoder_input_dim, z_dim=z_dim, state_dim=output_dim, output_dim=output_dim).to(device)
+    eval_flexible_decoder = FlexibleDynamicsDecoderRNN(input_dim=decoder_input_dim, z_dim=z_dim, state_dim=output_dim, output_dim=output_dim).to(device)
+    eval_decoder = eval_flexible_decoder  # Use the flexible decoder for evaluation
 
     # Reload best model
     eval_encoder.load_state_dict(torch.load(encoder_save_path))
     eval_decoder.load_state_dict(torch.load(decoder_save_path))
 
     # Plotting evaluation results
-    evaluate_dynamics_encoder(eval_encoder, eval_decoder, val_dataloader, loss_fn, plot=True)
+    evaluate_dynamics_encoder(eval_encoder, eval_decoder, encoder_window_length, val_dataloader, loss_fn, plot=True, decode_using_encoder=decode_using_encoder, decode_using_input=decode_using_input)
