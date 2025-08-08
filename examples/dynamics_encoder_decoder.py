@@ -11,23 +11,25 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def export_encoder_to_onnx(encoder, export_path="dynamics_encoder.onnx"):
     encoder.eval()
-    B, T, D = 1, 100, 6  # batch size 1, time steps 100, input dim 6
+    B, T, D = 1, 1, 6  # batch size 1, time steps 100, input dim 6
     x_dummy = torch.randn(B, T, D)
-    lengths_dummy = torch.tensor([T])  # full length sequence
-    x_dummy, lengths_dummy = x_dummy.to(device), lengths_dummy.to(device)
-    
+    h_dummy = torch.zeros(1, B, encoder.get_hidden_dim())  # (num_layers, batch_size, hidden_dim)
+    x_dummy, h_dummy = x_dummy.to(device), h_dummy.to(device)
+
     torch.onnx.export(
         encoder,
-        (x_dummy, ),
+        (x_dummy, h_dummy),
         export_path,
         export_params=True,
         opset_version=11,
-        input_names=["input"],
-        output_names=["z_dyn"],
+        input_names=["input", "h_in"],
+        output_names=["z_dyn", "h_out"],
         # Remove dynamic_axes for batch_size
         dynamic_axes={
-            "input": {1: "time_steps"},
+            "input": {0: "batch_size"},
             "z_dyn": {0: "batch_size"},
+            "h_in": {0: "batch_size"},
+            "h_out": {1: "batch_size"}
         }
     )
     print(f"ONNX model exported to {export_path}")
@@ -60,95 +62,104 @@ def masked_mse(pred, target, mask):
 #             _, h_n = self.gru(packed)
 #         return self.fc(h_n.squeeze(0))  # (B, z_dim)
 
+# class DynamicsRNNEncoder(nn.Module):
+#     def __init__(self, input_dim=6, hidden_dim=64, z_dim=32, use_mask=False):
+#         super().__init__()
+#         self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
+#         self.fc = nn.Linear(hidden_dim, z_dim)
+#         self.use_mask = use_mask  # optional if you want to add masking later
+#         self.exporting = False  # NEW FLAG
+
+#     def set_export(self, export: bool):
+#         self.exporting = export
+
+#     def forward(self, x, mask=None):  # x: (B, T, input_dim)
+#         """
+#         If mask is None: just use final time step (assumes padding is zeroed or irrelevant).
+#         If mask is provided: use the last valid time step per sample.
+#         """
+#         output, _ = self.gru(x)  # output: (B, T, hidden_dim)
+
+#         if self.exporting:
+#             h_n = output[:, -1, :]  # ONNX-safe: use last token
+#         elif self.use_mask and mask is not None:
+#             # Get the last valid step using mask (B, T)
+#             lengths = mask.sum(dim=1)  # (B,)
+#             idx = (lengths - 1).clamp(min=0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1)
+#             idx = idx.expand(-1, 1, output.size(2))  # (B, 1, H)
+#             h_n = output.gather(dim=1, index=idx).squeeze(1)  # (B, H)
+#         else:
+#             h_n = output[:, -1, :]  # assume last token is valid (i.e., padding at the end is fine)
+
+#         return self.fc(h_n)  # (B, z_dim)
+    
 class DynamicsRNNEncoder(nn.Module):
-    def __init__(self, input_dim=6, hidden_dim=64, z_dim=32, use_mask=False):
-        super().__init__()
-        self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, z_dim)
-        self.use_mask = use_mask  # optional if you want to add masking later
-        self.exporting = False  # NEW FLAG
-
-    def set_export(self, export: bool):
-        self.exporting = export
-
-    def forward(self, x, mask=None):  # x: (B, T, input_dim)
-        """
-        If mask is None: just use final time step (assumes padding is zeroed or irrelevant).
-        If mask is provided: use the last valid time step per sample.
-        """
-        output, _ = self.gru(x)  # output: (B, T, hidden_dim)
-
-        if self.exporting:
-            h_n = output[:, -1, :]  # ONNX-safe: use last token
-        elif self.use_mask and mask is not None:
-            # Get the last valid step using mask (B, T)
-            lengths = mask.sum(dim=1)  # (B,)
-            idx = (lengths - 1).clamp(min=0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1)
-            idx = idx.expand(-1, 1, output.size(2))  # (B, 1, H)
-            h_n = output.gather(dim=1, index=idx).squeeze(1)  # (B, H)
-        else:
-            h_n = output[:, -1, :]  # assume last token is valid (i.e., padding at the end is fine)
-
-        return self.fc(h_n)  # (B, z_dim)
-
-
-class FlexibleDynamicsDecoderRNN(nn.Module):
-    def __init__(self, input_dim=2, z_dim=32, state_dim=4, hidden_dim=128, output_dim=4):
+    def __init__(self, input_dim, z_dim=16, hidden_dim=64):
         super().__init__()
         self.input_dim = input_dim
         self.z_dim = z_dim
-        self.state_dim = state_dim
         self.hidden_dim = hidden_dim
 
-        self.gru = nn.GRU(input_dim + state_dim + z_dim, hidden_dim, batch_first=True)
+        self.gru = nn.GRU(self.input_dim, self.hidden_dim, batch_first=True)
+        self.fc = nn.Linear(self.hidden_dim, self.z_dim)
+
+    def forward(self, obs_t, h_t): # obs_t can be a single step or a sequence
+        x = obs_t
+        # x = x.unsqueeze(1) # (B, 1, input_dim)
+
+        # GRU step
+        output, h_t_next = self.gru(x, h_t)          # output: (B, 1, H), h_t_next: (1, B, H)
+        last_hidden = output[:, -1, :]                # (B, hidden_dim)
+        z_dyn = self.fc(last_hidden.unsqueeze(1))           # (B, 1, z_dim)
+        return z_dyn, h_t_next
+
+    def init_hidden(self, batch_size=1, device='cpu'):
+        return torch.zeros(1, batch_size, self.hidden_dim, device=device)
+    
+    def get_z_dim(self):
+        return self.z_dim
+    
+    def get_hidden_dim(self):
+        return self.hidden_dim
+
+
+class FlexibleDynamicsDecoderRNN(nn.Module):
+    def __init__(self, obs_dim=2, z_dim=32, state_dim=4, hidden_dim=128, output_dim=4):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.z_dim = z_dim
+        self.state_dim = state_dim # dimenstion of y, which is the previous output
+        self.hidden_dim = hidden_dim
+
+        self.input_dim = obs_dim + z_dim + state_dim  # (f_i, x_i, v_i, z_dyn, y_prev)
+
+        self.gru = nn.GRU(self.input_dim, hidden_dim, batch_first=True)
         self.fc_out = nn.Linear(hidden_dim, output_dim)
 
-    def step(self, obs_t, y_prev, z_dyn, h_prev):
+    def forward(self, obs_t, z_dyn, h_prev, y_prev=None):
         """
         Single step forward pass.
-        obs_t: (B, N) or None
-        y_prev: (B, state_dim)
-        z_dyn: (B, z_dim) or None
+        obs_t: (B, 1, N) or None
+        y_prev: (B, 1, state_dim)
+        z_dyn: (B, 1, z_dim) or None
         h_prev: (1, B, hidden_dim)
         """
-        B = y_prev.size(0)
-        if obs_t is None:
-            obs_t = torch.zeros(B, self.input_dim, device=y_prev.device)
-        input_parts = [obs_t, y_prev]
+        input_parts = []
+        if obs_t is not None:
+            input_parts.append(obs_t)
         if z_dyn is not None:
             input_parts.append(z_dyn)
-        input_t = torch.cat(input_parts, dim=-1).unsqueeze(1)  # (B, 1, D)
+        if y_prev is not None:
+            input_parts.append(y_prev)
+        
+        if not input_parts:
+            raise ValueError("At least one of obs_t, z_dyn, or y_prev must be provided.")
+
+        input_t = torch.cat(input_parts, dim=-1) # (B, 1, D)
+
         out_t, h_next = self.gru(input_t, h_prev)  # out_t: (B, 1, H)
-        y_next = self.fc_out(out_t.squeeze(1))     # (B, 4)
+        y_next = self.fc_out(out_t)     # (B, 1, O)
         return y_next, h_next
-
-    def forward(self, init_y, obs_seq=None, z_dyn=None, rollout_steps=None):
-        """
-        obs_seq: (B, T, N) or None
-        init_y: (B, state_dim)
-        z_dyn: (B, z_dim) or None
-        rollout_steps: int, used only when obs_seq is None
-        """
-        B = init_y.size(0)
-        y_prev = init_y
-        h = torch.zeros(1, B, self.hidden_dim, device=init_y.device)
-        outputs = []
-
-        if obs_seq is not None:
-            T = obs_seq.size(1)
-            for t in range(T):
-                obs_t = obs_seq[:, t, :]  # (B, 2)
-                y, h = self.step(obs_t, y_prev, z_dyn, h)
-                outputs.append(y)
-                y_prev = y
-        else:
-            assert rollout_steps is not None, "rollout_steps is required when obs_seq is None"
-            for _ in range(rollout_steps):
-                y, h = self.step(None, y_prev, z_dyn, h)
-                outputs.append(y)
-                y_prev = y
-
-        return torch.stack(outputs, dim=1)  # (B, T, 4)
     
     def init_hidden(self, batch_size=1, device='cpu'):
         return torch.zeros(1, batch_size, self.hidden_dim, device=device)
