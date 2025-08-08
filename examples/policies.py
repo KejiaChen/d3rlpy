@@ -3,24 +3,48 @@ import torch.nn as nn
 import torch.distributions as D
 
 
-def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic", export_path="mlp_policy.onnx", step_wise=False):
+def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic_mlp", export_path="mlp_policy.onnx", step_wise=False):
     policy.eval()
-    if seq_len is not None and seq_len > 1:
-        dummy_input = torch.randn(1, 1, seq_len, obs_dim)
-        torch.onnx.export(
-        policy, 
-        dummy_input, 
-        export_path,
-        export_params=True,
-        opset_version=11,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes={
-            "input": {0: "batch_size"},  # support variable batch size
-            "output": {0: "batch_size"}
-        }
-    )
-    elif policy_type == "gru_with_encoder" or policy_type == "gru_no_encoder":
+    if policy_type == "stochastic_mlp":
+        if seq_len is not None and seq_len > 1:
+            dummy_input = torch.randn(1, 1, seq_len, obs_dim)
+            dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
+
+            dummy_input, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
+
+            torch.onnx.export(
+                policy, 
+                (dummy_input, dummy_z_dyn),
+                export_path,
+                export_params=True,
+                opset_version=11,
+                input_names=["input", "z_dyn"],
+                output_names=["output"],
+                dynamic_axes={
+                    "input": {0: "batch_size"},  # support variable batch size
+                    "output": {0: "batch_size"}
+                }
+            )
+        else:
+            dummy_input = torch.randn(1, 1, obs_dim)  # 3D input: (batch_size, seq_len, obs_dim) to match the expected input shape in cpp
+            dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
+
+            dummy_input, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
+
+            torch.onnx.export(
+                policy, 
+                (dummy_input, dummy_z_dyn),  # Tuple of inputs
+                export_path,
+                export_params=True,
+                opset_version=11,
+                input_names=["input", "z_dyn"],
+                output_names=["output"],
+                dynamic_axes={
+                    "input": {0: "batch_size"},  # support variable batch size
+                    "output": {0: "batch_size"}
+                }
+            )
+    elif policy_type == "gru":
         if step_wise:
             dummy_input = torch.randn(1, obs_dim)
             dummy_z_dyn = torch.randn(1, policy.get_z_dim())    # (B, z_dim)
@@ -29,21 +53,21 @@ def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic", ex
             dummy_input, dummy_z_dyn, dummy_h = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device), dummy_h.to(next(policy.parameters()).device)
 
             torch.onnx.export(
-            policy,
-            (dummy_input, dummy_z_dyn, dummy_h),  # Tuple of inputs
-            export_path,
-            export_params=True,
-            opset_version=11,
-            input_names=["obs_seq", "z_dyn", "h_in"],
-            output_names=["output", "h_out"],
-            dynamic_axes={
-                "obs_seq": {0: "batch_size"},
-                "z_dyn": {0: "batch_size"},
-                "h_in": {0: "batch_size"},
-                "output": {0: "batch_size"},
-                "h_out": {0: "batch_size"},
-            },
-        )
+                policy,
+                (dummy_input, dummy_z_dyn, dummy_h),  # Tuple of inputs
+                export_path,
+                export_params=True,
+                opset_version=11,
+                input_names=["obs_seq", "z_dyn", "h_in"],
+                output_names=["output", "h_out"],
+                dynamic_axes={
+                    "obs_seq": {0: "batch_size"},
+                    "z_dyn": {0: "batch_size"},
+                    "h_in": {0: "batch_size"},
+                    "output": {0: "batch_size"},
+                    "h_out": {0: "batch_size"},
+                },
+            )
         else:
             dummy_input = torch.randn(1, 1, obs_dim)
             dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())               # (B, 1, z_dim)
@@ -52,36 +76,21 @@ def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic", ex
             dummy_input, dummy_z_dyn, dummy_h = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device), dummy_h.to(next(policy.parameters()).device)
 
             torch.onnx.export(
-            policy,
-            (dummy_input, dummy_z_dyn, dummy_h),  # Tuple of inputs
-            export_path,
-            export_params=True,
-            opset_version=11,
-            input_names=["obs_seq", "z_dyn", "h_in"],
-            output_names=["output", "h_out"],
-            dynamic_axes={
-                "obs_seq": {0: "batch_size"},
-                "z_dyn": {0: "batch_size"},
-                "h_in": {1: "batch_size"},
-                "output": {0: "batch_size"},
-                "h_out": {1: "batch_size"},
-            }
-    )
-    else:
-        dummy_input = torch.randn(1, 1, obs_dim)  # 3D input: (batch_size, seq_len, obs_dim) to match the expected input shape in cpp
-        torch.onnx.export(
-        policy, 
-        dummy_input, 
-        export_path,
-        export_params=True,
-        opset_version=11,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes={
-            "input": {0: "batch_size"},  # support variable batch size
-            "output": {0: "batch_size"}
-        }
-    )
+                policy,
+                (dummy_input, dummy_z_dyn, dummy_h),  # Tuple of inputs
+                export_path,
+                export_params=True,
+                opset_version=11,
+                input_names=["obs_seq", "z_dyn", "h_in"],
+                output_names=["output", "h_out"],
+                dynamic_axes={
+                    "obs_seq": {0: "batch_size"},
+                    "z_dyn": {0: "batch_size"},
+                    "h_in": {1: "batch_size"},
+                    "output": {0: "batch_size"},
+                    "h_out": {1: "batch_size"},
+                }
+            )
     print(f"ONNX model exported to {export_path}")
 
 class MLPPolicy(nn.Module):
@@ -129,30 +138,43 @@ class MLPSeqPolicy(nn.Module):
             raise ValueError(f"Unsupported obs_seq shape: {obs_seq.shape}")
     
 class StochasticMLPPolicy(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden_dims=(128, 128)):
+    def __init__(self, obs_dim, act_dim, z_dim=32, hidden_dims=(128, 128)):
         super().__init__()
+        self.obs_dim = obs_dim
+        self.z_dim = z_dim
+        input_dim = obs_dim + z_dim  # Combined input
+
         layers = []
-        dims = [obs_dim] + list(hidden_dims)
+        dims = [input_dim] + list(hidden_dims)
         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
             layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
         self.encoder = nn.Sequential(*layers)
 
-        # Output mean action
         self.mean_head = nn.Linear(dims[-1], act_dim)
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
 
-        # Log std is a learnable parameter, shared across states
-        self.log_std = nn.Parameter(torch.zeros(act_dim))  # or init to small value
-
-    def forward(self, x):
+    def forward(self, obs, z_dyn=None):
+        # obs: (B, obs_dim), z_dyn: (B, z_dim)
+        if z_dyn is None: # z_dyn is only None when z_dim = 0
+            x = obs
+        else:
+            x = torch.cat([obs, z_dyn], dim=-1)
         latent = self.encoder(x)
         mean = self.mean_head(latent)
         return mean
-    
-    def get_dist(self, x):
+
+    def get_dist(self, obs, z_dyn=None):
+        if z_dyn is None:
+            x = obs
+        else:
+            x = torch.cat([obs, z_dyn], dim=-1)
         latent = self.encoder(x)
         mean = self.mean_head(latent)
         std = torch.exp(self.log_std)
         return torch.distributions.Normal(mean, std)
+    
+    def get_z_dim(self):
+        return self.z_dim
 
 class StochasticMLPSeqPolicy(nn.Module):
     def __init__(self, obs_dim, act_dim, seq_len: int, hidden_dims=(128, 128)):
@@ -273,6 +295,12 @@ class StochasticRNNPolicyStepwise(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(act_dim))
 
     def forward(self, obs_t, z_dyn_t, h_t):
+        """
+        obs_t: (B, 1, N) or None
+        y_prev: (B, 1, state_dim)
+        z_dyn: (B, 1, z_dim) or None
+        h_prev: (1, B, hidden_dim)
+        """
         terminal = obs_t[:, -1] > 0.5  # (B, T) boolean mask
         obs_input = obs_t[:, :-1]     # remove terminal flag: (B, T, obs_dim - 1)
 
