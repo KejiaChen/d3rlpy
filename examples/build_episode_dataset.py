@@ -12,6 +12,109 @@ import torch
 
 ONLINE_SOURCES = {"ForceControl":["f_ext", "dx", "f_ext_sensor", "ff", "x"]}
 
+SETUP_LABELS = {"R_L_H_1_C_L_1": 1,
+                "R_L_H_1_C_L_2": 2,
+                "R_L_H_1_C_S_2": 3,
+                "R_M_L_1_C_L_1": 4,
+                "R_M_L_1_C_L_2": 5,
+                "R_M_L_1_C_S_2": 6,
+                "R_M_M_1_C_L_1": 7,
+                "R_M_M_1_C_L_2": 8,
+                "R_M_M_1_C_S_2": 9,
+                "W_S_M_1_C_L_1": 10,
+                "W_S_M_1_C_L_2": 11,
+                "W_S_M_1_C_S_2": 12}
+
+def normalize_obs(obs):
+    if obs.dim() == 2:
+        obs = obs.clone()
+        # Force: [0, 30] → scale to [0, 1]
+        obs[:, 0] /= 30.0  # stretch force
+        obs[:, 3] /= 30.0  # push force
+
+        # Distance: normalize using global mean/std or empirical range
+        # Estimate these from your dataset (preprocess)
+        distance_scale = 0.05  # or use empirical max (e.g., 0.015 or 0.025)
+        obs[:, 1] /= distance_scale  # stretch displacement
+        obs[:, 4] /= distance_scale  # push displacement
+        # # Velocity: estimate from data (e.g., max ~0.05 m/s)
+        velocity_scale = 0.1
+        obs[:, 2] /= velocity_scale
+        obs[:, 5] /= velocity_scale
+    elif obs.dim() == 3:
+        obs = obs.clone()
+        # Force: [0, 30] → scale to [0, 1]
+        obs[:, :, 0] /= 30.0  # stretch force
+        obs[:, :, 3] /= 30.0  # push force
+        # Distance: normalize using global mean/std or empirical range
+        distance_scale = 0.05  # or use empirical max (e.g., 0.015 or 0.025)
+        obs[:, :, 1] /= distance_scale
+        obs[:, :, 4] /= distance_scale  # push displacement
+        # Velocity: estimate from data (e.g., max ~0.05 m/s)
+        velocity_scale = 0.1
+        obs[:, :, 2] /= velocity_scale
+        obs[:, :, 5] /= velocity_scale
+    else:
+        raise ValueError(f"Expected obs to be 2D or 3D, got {obs.shape}")
+    return obs
+
+def unnormalize_obs(normalized_obs):
+    if normalized_obs.dim() == 2:
+        obs = normalized_obs.clone()
+        # Force: [0, 1] → scale to [0, 30]
+        obs[:, 0] *= 30.0
+        obs[:, 3] *= 30.0
+        # Distance: scale back using global mean/std or empirical range
+        distance_scale = 0.05
+        obs[:, 1] *= distance_scale  # stretch displacement
+        obs[:, 4] *= distance_scale
+        # Velocity: scale back using estimated max (e.g., 0.1 m/s)
+        velocity_scale = 0.1
+        obs[:, 2] *= velocity_scale
+        obs[:, 5] *= velocity_scale
+    elif normalized_obs.dim() == 3:
+        obs = normalized_obs.clone()
+        # Force: [0, 1] → scale to [0, 30]
+        obs[:, :, 0] *= 30.0
+        obs[:, :, 3] *= 30.0
+        # Distance: scale back using global mean/std or empirical range
+        distance_scale = 0.05
+        obs[:, :, 1] *= distance_scale
+        obs[:, :, 4] *= distance_scale
+        # Velocity: scale back using estimated max (e.g., 0.1 m/s)
+        velocity_scale = 0.1
+        obs[:, :, 2] *= velocity_scale
+        obs[:, :, 5] *= velocity_scale
+    else:
+        raise ValueError(f"Expected obs to be 2D or 3D, got {obs.shape}")
+    return obs
+
+def normalize_acts(acts):
+    if acts.dim() == 2:
+        acts = acts.clone()
+        acts[:, 0] /= 30.0  # stretch force ff
+        acts[:, 1] /= 30.0  # push force ff
+    elif acts.dim() == 3:
+        acts = acts.clone()
+        acts[:, :, 0] /= 30.0
+        acts[:, :, 1] /= 30.0
+    else:
+        raise ValueError(f"Expected acts to be 2D or 3D, got {acts.shape}")
+    return acts
+
+def unnormalize_acts(normalized_acts):
+    if normalized_acts.dim() == 2:
+        acts = normalized_acts.clone()
+        acts[:, 0] *= 30.0  # stretch force ff
+        acts[:, 1] *= 30.0  # push force ff
+    elif normalized_acts.dim() == 3:
+        acts = normalized_acts.clone()
+        acts[:, :, 0] *= 30.0
+        acts[:, :, 1] *= 30.0
+    else:
+        raise ValueError(f"Expected normalized_acts to be 2D or 3D, got {normalized_acts.shape}")
+    return acts
+
 def compute_average_reference_values(group_references):
     stretch_forces, stretch_effort, stretch_energy, push_forces, push_effort, push_energy, deformation_values, durations = [], [], [], [], [], [], [], []
     for key, ref_values in group_references.items():
@@ -66,6 +169,13 @@ def compute_group_typed_reference_values(base_dir, env_step=5):
             if cable_id is None or clip_id is None:
                 print(f"\033[91mSkipping {mios_traj_dir} due to missing cable_id or clip_id.\033[0m")
                 continue
+
+            if f"{cable_id}_{clip_id}" in SETUP_LABELS:
+                setup_label = SETUP_LABELS[f"{cable_id}_{clip_id}"]
+            else:
+                raise ValueError(f"Unknown setup label for {cable_id}_{clip_id}")
+            parameters["setup_label"] = setup_label
+            json.dump(parameters, open(os.path.join(mios_traj_dir, "parameters.json"), 'w'), indent=4)
 
             group_key = f"{cable_id}_{clip_id}_pose_{fixing_pose_id}" if fixing_pose_id else f"{cable_id}_{clip_id}"
 
@@ -258,6 +368,13 @@ def load_and_preprocess_fixing_result(result_path):
     else:
         return False
 
+def load_setup_label(parameters_path):
+    parameters = json.load(open(parameters_path, 'r'))
+    setup_label = parameters.get("setup_label", None)
+    if setup_label is None:
+        raise ValueError(f"Missing setup_label in {parameters_path}")
+    return setup_label
+
 def load_and_preprocess_terminal(traj_path, obs_buffer, acts_buffer, fixing_index=-1):
     terminal_file = os.path.join(traj_path, "terminal.txt")
     terminal_buffer = np.zeros(obs_buffer.shape[0], dtype=bool)
@@ -397,6 +514,7 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
             continue
         else:
             fixing_success = load_and_preprocess_fixing_result(os.path.join(mios_traj_dir, "fixing_result.json"))
+            setup_label = load_setup_label(os.path.join(mios_traj_dir, "parameters.json"))
 
             if post_sensing:
                 post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index = load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw, fixing_success)
@@ -457,7 +575,7 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
 
     # plotting
     plot_force(obs_buffer, acts_buffer, base_dir, traj_dir, terminal_index)
-    return obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_success
+    return obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_success, setup_label
 
 def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, load_terminal_in_obs=False):
     if not reload_data and os.path.exists(os.path.join(base_dir, "episode_dataset.npz")):
@@ -469,19 +587,17 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
             actions=data["actions"],
             terminals=data["terminals"],
             returns=data["returns"],
-            load_terminals=load_terminal_in_obs
+            load_terminals=load_terminal_in_obs,
+            labels=data["label"]
         )
     else:
         # === Step 1: compute reference values across all episodes ===
-        grouped_ref_values = compute_group_sized_reference_values(base_dir, env_step=env_step)
+        grouped_ref_values = compute_group_typed_reference_values(base_dir, env_step=env_step)
         # save as json
         with open(os.path.join(base_dir, "reference_values.json"), 'w') as f:
             json.dump(grouped_ref_values, f, indent=4)
 
-        all_observations = []
-        all_actions = []
-        all_returns = []
-        all_terminals = []
+        all_observations, all_actions, all_returns, all_terminals, all_labels = [], [], [], [], []
 
         for traj_dir in sorted(os.listdir(base_dir)):
             traj_path = os.path.join(base_dir, traj_dir)
@@ -495,7 +611,7 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
                     traj_ref_values = ref_values["refs"].copy()
                     break
 
-            obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_result = load_one_episode(traj_path, 
+            obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_result, setup_label = load_one_episode(traj_path, 
                                                                                                     env_step=env_step,
                                                                                                     post_sensing=True,
                                                                                                     include_deformation_in_return=True,
@@ -503,14 +619,15 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
                                                                                                     return_kwargs=traj_ref_values)
             
             # filter out outliers with flat curves
-            if np.max(obs_buffer[:, 3]) - obs_buffer[0, 3] < 3:
-                print(f"\033[91mSkipping trajectory {traj_dir} due to flat pushing with difference {np.max(obs_buffer[:, 3]) - obs_buffer[0, 3]}.\033[0m")
-                continue
+            # if np.max(obs_buffer[:, 3]) - obs_buffer[0, 3] < 3:
+            #     print(f"\033[91mSkipping trajectory {traj_dir} due to flat pushing with difference {np.max(obs_buffer[:, 3]) - obs_buffer[0, 3]}.\033[0m")
+            #     continue
             
             all_observations.append(obs_buffer)
             all_actions.append(acts_buffer)
             all_returns.append(ep_return)
             all_terminals.append(terminals_buffer)
+            all_labels.append(setup_label)
 
             # check if their size is consistent
             if not (obs_buffer.shape[0] == acts_buffer.shape[0]== terminals_buffer.shape[0]):
@@ -524,7 +641,8 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
             observations=np.array(all_observations, dtype=object),
             actions=np.array(all_actions, dtype=object),
             terminals=np.array(all_terminals, dtype=object),    
-            returns=np.array(all_returns, dtype=np.float32)
+            returns=np.array(all_returns, dtype=np.float32),
+            label=np.array(all_labels, dtype=object)  # save the setup label for each trajectory
         )
         print(f"Reloaded episode dataset saved to {os.path.join(base_dir, 'episode_dataset.npz')}")
 
@@ -533,7 +651,9 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
                             terminals=all_terminals,
                             returns=all_returns,
                             timeouts=None,
-                            load_terminals=load_terminal_in_obs)  # timeouts are not used in this case
+                            load_terminals=load_terminal_in_obs,
+                            labels=all_labels
+                            )  # timeouts are not used in this case
 
 def plot_force(obs, act, base_dir, traj_dir, terminal_index):
     import matplotlib.pyplot as plt
@@ -553,9 +673,9 @@ def plot_force(obs, act, base_dir, traj_dir, terminal_index):
     time = np.arange(obs.shape[0])
 
     # Create subplots
-    fig, axs = plt.subplots(2, 1, figsize=(10, 10))
+    fig, axs = plt.subplots(3, 1, figsize=(10, 10))
 
-    # Plot force vs distance
+    # Plot distance vs time
     axs[0].plot(time, obs[:, 1], label=f'Stretch Distance', color='orange')
     axs[0].plot(time, obs[:, 4], label=f'Push Distance', color='blue')
     axs[0].axvline(x=terminal_index, color='red', linestyle='-.', label='Finish')
@@ -565,17 +685,27 @@ def plot_force(obs, act, base_dir, traj_dir, terminal_index):
     axs[0].legend()
     axs[0].grid()
 
-    # Plot force vs time
-    axs[1].plot(time, obs[:, 0], label=f'Ext Stretch Force', color='orange')
-    axs[1].plot(time, act[:, 0], label=f'FF Stretch Force', linestyle='--', color='orange')
-    axs[1].plot(time, obs[:, 3], label=f'Ext Push Force', color='blue')
-    axs[1].plot(time, act[:, 1], label=f'FF Push Force', linestyle='--', color='blue')
+    # Plot velocity vs time
+    axs[1].plot(time, obs[:, 2], label=f'Stretch Velocity', color='orange')
+    axs[1].plot(time, obs[:, 5], label=f'Push Velocity', color='blue')
     axs[1].axvline(x=terminal_index, color='red', linestyle='-.', label='Finish')
     axs[1].set_xlabel('Time (ms)')
-    axs[1].set_ylabel('Force (N)')
-    axs[1].set_title(f'Force vs Time')
+    axs[1].set_ylabel('Velocity (m/s)')
+    axs[1].set_title(f'Velocity vs Time')
     axs[1].legend()
     axs[1].grid()
+
+    # Plot force vs time
+    axs[2].plot(time, obs[:, 0], label=f'Ext Stretch Force', color='orange')
+    axs[2].plot(time, act[:, 0], label=f'FF Stretch Force', linestyle='--', color='orange')
+    axs[2].plot(time, obs[:, 3], label=f'Ext Push Force', color='blue')
+    axs[2].plot(time, act[:, 1], label=f'FF Push Force', linestyle='--', color='blue')
+    axs[2].axvline(x=terminal_index, color='red', linestyle='-.', label='Finish')
+    axs[2].set_xlabel('Time (ms)')
+    axs[2].set_ylabel('Force (N)')
+    axs[2].set_title(f'Force vs Time')
+    axs[2].legend()
+    axs[2].grid()
 
     # Adjust layout and show the plot
     plt.tight_layout()

@@ -4,7 +4,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
-from build_episode_dataset import load_trajectories
+from build_episode_dataset import load_trajectories, normalize_obs
 from return_functions import *
 from dynamics_encoder_decoder import *
 from train_ciip_fixing_episodewise_rnn import get_obs_padded_window
@@ -12,24 +12,6 @@ from train_ciip_fixing_episodewise_rnn import get_obs_padded_window
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Collate function with padding ---
-def normalize_obs(obs):
-    obs = obs.clone()
-    # Force: [0, 30] → scale to [0, 1]
-    obs[:, 0] /= 30.0  # stretch force
-    obs[:, 3] /= 30.0  # push force
-
-    # Distance: normalize using global mean/std or empirical range
-    # Estimate these from your dataset (preprocess)
-    distance_scale = 0.05  # or use empirical max (e.g., 0.015 or 0.025)
-    obs[:, 1] /= distance_scale  # stretch displacement
-    obs[:, 4] /= distance_scale  # push displacement
-
-    # # Velocity: estimate from data (e.g., max ~0.05 m/s)
-    velocity_scale = 0.1
-    obs[:, 2] /= velocity_scale
-    obs[:, 5] /= velocity_scale
-    return obs
-
 def collate_dyn_embedding_2(batch):
     input_seqs = []
     target_seqs = []
@@ -73,7 +55,7 @@ def collate_dyn_embedding(batch):
     lengths = []
 
     for data in batch:
-        obs, act, weight, terminals = data
+        obs, act, weight, terminals, setup_label = data
         terminals = np.array(terminals)
         if not np.any(terminals):
             continue
@@ -104,8 +86,7 @@ def collate_dyn_embedding(batch):
     lengths = torch.tensor(lengths)
     mask = torch.arange(full_x_padded.size(1)).unsqueeze(0) < lengths.unsqueeze(1)
 
-    return full_x_padded, force_only_x_padded, y_padded, mask, lengths, y_initials
-
+    return full_x_padded, force_only_x_padded, y_padded, mask, lengths, y_initials, setup_label
 
 def plot_trajectory(y_batch, y_pred, lengths, traj_id, plot_dir="plots"):
     import matplotlib.pyplot as plt
@@ -115,10 +96,10 @@ def plot_trajectory(y_batch, y_pred, lengths, traj_id, plot_dir="plots"):
     fig, axs = plt.subplots(3, 1, figsize=(10, 10))
 
     # Plot distance vs time
-    axs[0].plot(time, y_batch[:valid_T, 0].cpu().numpy(), label='Stretch Distance', color='orange')
-    axs[0].plot(time, y_batch[:valid_T, 2].cpu().numpy(), label='Push Distance', color='blue')
-    axs[0].plot(time, y_pred[:valid_T, 0].cpu().numpy(), label='Reconstructed Stretch Distance', color='orange', linestyle='--')
-    axs[0].plot(time, y_pred[:valid_T, 2].cpu().numpy(), label='Reconstructed Push Distance', color='blue', linestyle='--')
+    axs[0].plot(time, 0.05*y_batch[:valid_T, 1].cpu().numpy(), label='Stretch Distance', color='orange')
+    axs[0].plot(time, 0.05*y_batch[:valid_T, 4].cpu().numpy(), label='Push Distance', color='blue')
+    axs[0].plot(time, 0.05*y_pred[:valid_T, 1].cpu().numpy(), label='Reconstructed Stretch Distance', color='orange', linestyle='--')
+    axs[0].plot(time, 0.05*y_pred[:valid_T, 4].cpu().numpy(), label='Reconstructed Push Distance', color='blue', linestyle='--')
     axs[0].set_xlabel('Time (ms)')
     axs[0].set_ylabel('Distance from Start (m)')
     axs[0].set_title(f'Distance vs Time')
@@ -126,10 +107,10 @@ def plot_trajectory(y_batch, y_pred, lengths, traj_id, plot_dir="plots"):
     axs[0].grid()
 
     # # Plot velocity vs time
-    axs[1].plot(time, y_batch[:valid_T, 1].cpu().numpy(), label='Stretch Velocity', color='orange')
-    axs[1].plot(time, y_batch[:valid_T, 3].cpu().numpy(), label='Push Velocity', color='blue')
-    axs[1].plot(time, y_pred[:valid_T, 1].cpu().numpy(), label='Reconstructed Stretch Velocity', color='orange', linestyle='--')
-    axs[1].plot(time, y_pred[:valid_T, 3].cpu().numpy(), label='Reconstructed Push Velocity', color='blue', linestyle='--')
+    axs[1].plot(time, 0.1*y_batch[:valid_T, 2].cpu().numpy(), label='Stretch Velocity', color='orange')
+    axs[1].plot(time, 0.1*y_batch[:valid_T, 5].cpu().numpy(), label='Push Velocity', color='blue')
+    axs[1].plot(time, 0.1*y_pred[:valid_T, 2].cpu().numpy(), label='Reconstructed Stretch Velocity', color='orange', linestyle='--')
+    axs[1].plot(time, 0.1*y_pred[:valid_T, 5].cpu().numpy(), label='Reconstructed Push Velocity', color='blue', linestyle='--')
     axs[1].set_xlabel('Time (ms)')
     axs[1].set_ylabel('Velocity (m/s)')
     axs[1].set_title(f'Velocity vs Time')
@@ -138,9 +119,9 @@ def plot_trajectory(y_batch, y_pred, lengths, traj_id, plot_dir="plots"):
 
     # Plot force vs time
     axs[2].plot(time, 30*y_batch[:valid_T, 0].cpu().numpy(), label='Ext Stretch Force', color='orange')
-    axs[2].plot(time, 30*y_batch[:valid_T, 2].cpu().numpy(), label='Ext Push Force', color='blue')
+    axs[2].plot(time, 30*y_batch[:valid_T, 3].cpu().numpy(), label='Ext Push Force', color='blue')
     axs[2].plot(time, 30*y_pred[:valid_T, 0].cpu().numpy(), label='Reconstructed Ext Stretch Force', color='orange', linestyle='--')
-    axs[2].plot(time, 30*y_pred[:valid_T, 2].cpu().numpy(), label='Reconstructed Ext Push Force', color='blue', linestyle='--')
+    axs[2].plot(time, 30*y_pred[:valid_T, 3].cpu().numpy(), label='Reconstructed Ext Push Force', color='blue', linestyle='--')
     axs[2].set_xlabel('Time (ms)')
     axs[2].set_ylabel('Force (N)')
     axs[2].set_title(f'Force vs Time')
@@ -161,12 +142,19 @@ def evaluate_dynamics_encoder(encoder, decoder, encoder_window_length, val_loade
     decoder.eval()
     total_loss = 0.0
     with torch.no_grad():
-        for x_batch, force_only_batch, y_batch, mask, lengths, y_init in val_loader:
+        for x_batch, force_only_batch, y_batch, mask, lengths, y_init, labels in val_loader:
             y_pred, y_batch, mask = forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_batch, y_batch, mask, lengths, y_init, 
                                                 decode_using_encoder, decode_using_input)
 
             loss = loss_fn(y_pred, y_batch, mask)
             total_loss += loss.item()
+
+            # results = eval_early_predictivity(encoder, decoder, x_batch, force_only_batch, y_batch, mask, loss_fn,
+            #                                     freeze_k_list=(200, 400, 600, 800, 1000), encoder_window_length=encoder_window_length)
+            # print(f"New Trial")
+            # for K, loss in results.items():
+            #     print(f"K={K}, Loss={loss:.4f}")
+            #     total_loss += loss
 
             if plot:
                 for i in range(len(x_batch)):
@@ -176,6 +164,62 @@ def evaluate_dynamics_encoder(encoder, decoder, encoder_window_length, val_loade
     decoder.train()
     return total_loss / len(val_loader)
 
+@torch.no_grad()
+def eval_early_predictivity(encoder, decoder, x_batch, force_only_batch, y_batch, mask, loss_fn,
+                            freeze_k_list=(1,5,10,20,30,40,50), encoder_window_length=1):
+    x_batch = x_batch.to(device)
+    force_only_batch = force_only_batch.to(device)
+    y_batch = y_batch.to(device)
+    mask = mask.to(device)
+
+    encoder.eval()
+    decoder.eval()
+    B, T, _ = x_batch.size()
+    results = {}
+
+    for K in freeze_k_list:
+        if K >= T:
+            print(f"Stopping at K={K} as it exceeds sequence length T={T}.")
+            K = T
+
+        h_enc = encoder.init_hidden(B, device=x_batch.device)
+        h_dec = decoder.init_hidden(B, device=x_batch.device)
+        zK = None
+        preds = []
+
+        for t in range(T):
+            # --- update or freeze z
+            if t < K:
+                if encoder_window_length > 1:
+                    win = get_obs_padded_window(x_batch, t, encoder_window_length)  # (B,W,D)
+                    z_t, h_enc = encoder(win, h_enc)   # treat window call as stateless
+                else:
+                    x_t = x_batch[:, t, :].unsqueeze(1)  # (B,1,D)
+                    z_t, h_enc = encoder(x_t, h_enc)
+                if t == K-1:
+                    zK = z_t.detach()
+                z_used = z_t
+            else:
+                z_used = zK  # frozen latent
+
+            # --- decoder step (no extra inputs)
+            y_t, h_dec = decoder(obs_t=None, z_dyn=z_used, h_prev=h_dec, y_prev=None)
+            preds.append(y_t)
+
+        pred = torch.cat(preds, dim=1)  # (B,T,O)
+
+        # tail loss only on t >= K
+        Tmask = mask.clone()
+        idx = torch.arange(T, device=mask.device).unsqueeze(0).expand(B, -1)
+        tail_mask = Tmask & (idx >= K)
+        # loss_tail = masked_mse(pred, y_batch, tail_mask)
+        loss_tail = loss_fn(pred, y_batch, tail_mask)
+        results[K] = loss_tail.item()
+
+        if K == T:
+            break
+
+    return results
 
 def forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_batch, y_batch, mask, lengths, y_init, decode_using_encoder=True, decode_using_input=True):
     x_batch = x_batch.to(device)
@@ -191,6 +235,7 @@ def forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_ba
     h_encoder = encoder.init_hidden(B, device=device)  # Initialize hidden state
     h_decoder = decoder.init_hidden(B, device=device)  # Initialize decoder hidden state
     y_prev = y_init
+
     for t in range(T):
         if decode_using_encoder:
             if encoder_window_length > 1:
@@ -202,6 +247,7 @@ def forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_ba
                 x_t = x_batch[:, t, :]  # (B, obs_dim)
                 x_t = x_t.unsqueeze(1)  # (B, 1, obs_dim)
                 z_dyn, h_encoder = encoder(x_t, h_encoder)
+                # z_dyn = torch.zeros(B, 1, 16).to(device)  # Placeholder for z_dyn
         else:
             z_dyn = None
 
@@ -221,7 +267,7 @@ def forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_ba
 
 # --- Training loop ---
 if __name__ == "__main__":
-    train = False  # Set to False to skip training and only evaluate
+    train = True  # Set to False to skip training and only evaluate
     reload_data= False
     load_fixing_terminal_in_obs = True
     update_step = 5
@@ -258,7 +304,7 @@ if __name__ == "__main__":
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
     train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_dyn_embedding)
-    val_dataloader = DataLoader(val_dataset, batch_size=8, shuffle=False, collate_fn=collate_dyn_embedding)
+    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_dyn_embedding)
 
     loss_fn = masked_mse
 
@@ -285,7 +331,7 @@ if __name__ == "__main__":
         patience_counter = 0
         for epoch in range(200):
             total_loss = 0
-            for x_batch, force_only_batch, y_batch, mask, lengths, y_init in train_dataloader:
+            for x_batch, force_only_batch, y_batch, mask, lengths, y_init, labels in train_dataloader:
 
                 y_pred, y_batch, mask = forward_pass(encoder, decoder, encoder_window_length, x_batch, force_only_batch, y_batch, mask, lengths, y_init, decode_using_encoder, decode_using_input)
 
@@ -331,4 +377,4 @@ if __name__ == "__main__":
     eval_decoder.load_state_dict(torch.load(decoder_save_path))
 
     # Plotting evaluation results
-    evaluate_dynamics_encoder(eval_encoder, eval_decoder, encoder_window_length, val_dataloader, loss_fn, plot=True, decode_using_encoder=decode_using_encoder, decode_using_input=decode_using_input)
+    evaluate_dynamics_encoder(eval_encoder, eval_decoder, encoder_window_length, val_dataloader, loss_fn, plot=False, decode_using_encoder=decode_using_encoder, decode_using_input=decode_using_input)

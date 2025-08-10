@@ -13,7 +13,7 @@ from policies import *
 from dynamics_encoder_decoder import DynamicsRNNEncoder, masked_mse, export_encoder_to_onnx
 from return_functions import *
 
-from build_episode_dataset import load_trajectories
+from build_episode_dataset import load_trajectories, normalize_obs, unnormalize_obs, normalize_acts, unnormalize_acts
 import wandb
 import numpy as np
 import os
@@ -35,31 +35,54 @@ def collate_variable_episodes(batch, include_terminal=False):
         mask: (B, T_max) — bool
         lengths: (B,) — original episode lengths
     """
-    obs_list, act_list, weights, lengths = [], [], [], []
+    obs_list, act_list, weights, lengths, labels = [], [], [], [], []
 
     for data in batch:
         if include_terminal:
-            obs, act, weight, terminals = data
+            obs, act, weight, terminals, labels = data
             terminals = terminals.view(-1, 1)
+            obs = normalize_obs(obs)
             obs = torch.cat([obs, terminals], dim=-1)
+            act = normalize_acts(act)
             terminal_idx = (terminals.squeeze() == 1).nonzero(as_tuple=True)[0]
             ep_len = terminal_idx[0].item() + 1 if len(terminal_idx) > 0 else obs.shape[0]
         else:
-            obs, act, weight = data
+            obs, act, weight, labels = data
             ep_len = obs.shape[0]
 
         obs_list.append(obs)
         act_list.append(act)
         weights.append(weight)
-        lengths.append(ep_len)  
+        lengths.append(ep_len)
+        # labels.append(labels)
 
     lengths = torch.tensor(lengths)
+    # labels = torch.tensor(labels, dtype=torch.int64)
     obs_padded = pad_sequence(obs_list, batch_first=True)
     act_padded = pad_sequence(act_list, batch_first=True)
-    policy_mask = torch.ones(obs_padded.shape[0], dtype=torch.bool)
+    policy_mask = torch.ones(obs_padded.shape[0], obs_padded.shape[1], dtype=torch.bool)
     encoder_mask = torch.arange(obs_padded.size(1)).unsqueeze(0) < lengths.unsqueeze(1)  # (B, T_max)
 
-    return obs_padded, act_padded, torch.tensor(weights), policy_mask,encoder_mask, lengths
+    return obs_padded, act_padded, torch.tensor(weights), policy_mask, encoder_mask, lengths
+
+def encoder_forward_pass(obs_padded, obs_step, encoder_h, t, terminal_index, encoder_window_length, obs_dim):
+    if use_encoder:
+        if t >= terminal_index[0].item():
+            z_dyn = torch.zeros_like(z_dyn)
+        if encoder_window_length > 1:
+            windowed_input = get_obs_padded_window(obs_padded, t, encoder_window_length, window_obs_dim=obs_dim-1)  # (B, window_len, obs_dim-1)
+            z_dyn, encoder_h = encoder(windowed_input, encoder_h)
+        else:
+            single_input = obs_step[:, :-1].unsqueeze(1)  # (B, 1, obs_dim-1)
+            z_dyn, encoder_h = encoder(single_input, encoder_h)
+        
+        # TODO: temp solution
+        z_dyn = z_dyn.squeeze(1)
+    else:
+        z_dyn = None
+        encoder_h = None
+    return z_dyn, encoder_h
+
 
 def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, encoder_window_length, policy_mask, encoder_mask, policy, encoder, policy_type="gru", use_encoder=True, train=True):
     """
@@ -79,6 +102,7 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, en
         encoder_h = encoder.init_hidden(batch_size=B, device=obs_padded.device)  # Initialize encoder hidden state
     log_prob_seq = []
     pred_seq = []
+    entropy_seq = []
 
     if train:
         for t in range(T):
@@ -88,20 +112,22 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, en
 
             # 2. Encoder windowed input
             if use_encoder:
-                if t >= terminal_index[0].item():
-                    z_dyn = torch.zeros_like(z_dyn)
                 if encoder_window_length > 1:
                     windowed_input = get_obs_padded_window(obs_padded, t, encoder_window_length, window_obs_dim=obs_dim-1)  # (B, window_len, obs_dim-1)
                     z_dyn, encoder_h = encoder(windowed_input, encoder_h)
                 else:
                     single_input = obs_step[:, :-1].unsqueeze(1)  # (B, 1, obs_dim-1)
                     z_dyn, encoder_h = encoder(single_input, encoder_h)
+                if t >= terminal_index[0].item():
+                    z_dyn = torch.zeros_like(z_dyn)
+                
+                # TODO: temp solution
+                z_dyn = z_dyn.squeeze(1)
             else:
                 z_dyn = None
+                encoder_h = None
 
-            # TODO: temp solution
-            z_dyn = z_dyn.squeeze(1)
-
+           
             # 3. Policy step-by-step inference
             if policy_type == "stochastic_gru":
                 pred_dist_t, policy_h = policy.get_dist_step(obs_step, z_dyn, policy_h)  # (B, act_dim)
@@ -109,41 +135,69 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, en
                 pred_dist_t = policy.get_dist(obs_step, z_dyn)
             log_prob_t = pred_dist_t.log_prob(act_step).sum(-1) # (B,)
             log_prob_seq.append(log_prob_t)
+            entropy = pred_dist_t.entropy().sum(-1)          # per-step, sum over dims
+            entropy_seq.append(entropy)
 
         log_probs_tensor = torch.stack(log_prob_seq, dim=1)   # (B, T)
         forward_output = log_prob_seq
         loss_per_step = -log_probs_tensor                  # (B, T)
         loss_masked = loss_per_step[policy_mask]  # (num_valid_steps,)
+
+        entropy_tensor = torch.stack(entropy_seq, dim=1)  # (B, T)
+        entropy_masked = entropy_tensor[policy_mask]      # (num_valid_steps,)
+
+        # Expand weights from (B,) to (B, T)
+        weight_per_step = weights.unsqueeze(1).expand(-1, T)  # (B, T)
+        weight_masked = weight_per_step[policy_mask]  # (num_valid_steps,)
+
+        eps = 1e-8
+        weighted_loss = (loss_masked * weight_masked).sum() / (weight_masked.sum() + eps)
+        entropy_coef = 0.005
+        entropy_reg = entropy_masked.mean()
+        final_loss = weighted_loss - entropy_coef * entropy_reg
+        return forward_output, final_loss, weight_masked.sum().item()
     else:
         for t in range(T):
             # 1. One-step observation
             obs_step = obs_padded[:, t, :]  # (B, 1, obs_dim)
 
             # 2. Encoder windowed input
-            if t >= terminal_index[0].item():
-                z_dyn = torch.zeros_like(z_dyn) if use_encoder else None
-            windowed_input = get_obs_padded_window(obs_padded, t, encoder_window_length, window_obs_dim=obs_dim-1)  # (B, window_len, obs_dim-1)
-            # z_dyn = encoder(windowed_input, lengths=torch.tensor([windowed_input.size(1)]).to(obs_batch.device))  # (B, z_dim)
-            z_dyn = encoder(windowed_input) if use_encoder else None
+            if use_encoder:
+                if encoder_window_length > 1:
+                    windowed_input = get_obs_padded_window(obs_padded, t, encoder_window_length, window_obs_dim=obs_dim-1)  # (B, window_len, obs_dim-1)
+                    z_dyn, encoder_h = encoder(windowed_input, encoder_h)
+                else:
+                    single_input = obs_step[:, :-1].unsqueeze(1)  # (B, 1, obs_dim-1)
+                    z_dyn, encoder_h = encoder(single_input, encoder_h)
+                if t >= terminal_index[0].item():
+                    z_dyn = torch.zeros_like(z_dyn)
+
+                # TODO: temp solution
+                z_dyn = z_dyn.squeeze(1)
+
+            else:
+                z_dyn = None
+                encoder_h = None
 
             # 3. Policy single step input
             if policy_type == "stochastic_gru":
-                pred_step, h = policy(obs_step, z_dyn, h)
+                pred_step, policy_h = policy(obs_step, z_dyn, policy_h)
             elif policy_type == "stochastic_mlp":
                 pred_step = policy(obs_step, z_dyn)
             pred_seq.append(pred_step)
 
         pred = torch.stack(pred_seq, dim=1)  # (B, T, act_dim)
         forward_output = pred
-        loss_masked = masked_mse(pred, act_padded, policy_mask)
+        unnormalized_pred = unnormalize_acts(pred)
+        unnormalized_act = unnormalize_acts(act_padded)
+        
+        # Expand weights from (B,) to (B, T)
+        weight_per_step = weights.unsqueeze(1).expand(-1, T)  # (B, T)
+        weight_masked = weight_per_step[policy_mask]  # (num_valid_steps,)
 
-    # Expand weights from (B,) to (B, T)
-    weight_per_step = weights.unsqueeze(1).expand(-1, T)  # (B, T)
-    weight_masked = weight_per_step[policy_mask]  # (num_valid_steps,)
+        weighted_loss = masked_mse(unnormalized_pred, unnormalized_act, policy_mask, masked_weight=weight_masked)  # (B, T)
 
-    eps = 1e-8
-    weighted_loss = (loss_masked * weight_masked).sum() / (weight_masked.sum() + eps)
-    return forward_output, weighted_loss, weight_masked.sum().item()
+        return forward_output, weighted_loss, weight_masked.sum().item()
 
 def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, num_epochs=50, batch_size=8, lr=1e-3, policy_type="deterministic", use_encoder=True, log_dir=None, save_epoch=50):
     encoder.train()
@@ -176,8 +230,10 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, num_epochs=
             total_weight += batch_weight
 
         avg_loss = epoch_loss / max(total_weight, 1e-8)
-        print(f"Epoch {epoch}: Epoch loss {epoch_loss:.4f}, Weighted Avg Loss = {avg_loss:.8f}")
-        wandb.log({"epoch": epoch, "weighted_bc_loss": avg_loss})
+
+        val_loss = evaluate_weighted_bc(policy, encoder, dataloader, masked_mse, encoder_window_length=encoder_window_length, policy_type=policy_type, use_encoder=use_encoder, if_plot=False)
+        print(f"Epoch {epoch}: Epoch loss {epoch_loss:.4f}, Weighted Avg Loss = {avg_loss:.8f}, Val Loss = {val_loss:.8f}")
+        wandb.log({"epoch": epoch, "weighted_bc_loss": avg_loss, "val_loss": val_loss})
 
         if epoch % save_epoch == 0:
             if log_dir:
@@ -194,21 +250,25 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, num_epochs=
                 # encoder.set_export(False)  # Disable ONNX export after saving
 
         # Early stopping logic
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if val_loss < best_loss:
+            best_loss = val_loss
             patience_counter = 0  # Reset patience counter
             # Save the best model
             if log_dir:
                 best_model_path = os.path.join(log_dir, "best_policy.pth")
                 torch.save(policy.state_dict(), best_model_path)
-                print(f"Best model saved at epoch {epoch} with avg loss {best_loss:.4f}")
+                print(f"Best model saved at epoch {epoch} with validation loss {best_loss:.8f}")
+
+                best_encoder_path = os.path.join(log_dir, "best_encoder.pth")
+                torch.save(encoder.state_dict(), best_encoder_path)
+                print(f"Best encoder saved at epoch {epoch} with validation loss {best_loss:.8f}")
         else:
             patience_counter += 1
-            print(f"No improvement for {patience_counter} epochs (best loss: {best_loss:.4f})")
+            print(f"No improvement for {patience_counter} epochs (best loss: {best_loss:.8f})")
 
         # Check if patience is exceeded
-        if patience_counter >= 10:
-            print(f"Early stopping triggered at epoch {epoch}. Best loss: {best_loss:.4f}")
+        if patience_counter >= 5:
+            print(f"Early stopping triggered at epoch {epoch}. Best loss: {best_loss:.8f}")
             break
 
     return policy, encoder
@@ -251,35 +311,39 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, encoder_window_le
 
             # Optional visualization
             if if_plot:
-                for i in range(obs_batch.size(0)):
-                    T = obs_batch[i].size(0)
+                for b in range(obs_batch.size(0)):     #
+                    unnormalized_obs_ep = unnormalize_obs(obs_batch[b, :, :])
+                    unnormalized_act_ep = unnormalize_acts(act_batch[b, :, :])
+                    unnormalize_prediction = unnormalize_acts(pred[b, :, :])
+
+                    T = unnormalized_obs_ep.size(0)
                     fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-                    axs[0].plot(range(T), obs_batch[i, :, 0].cpu().numpy(), label="Observation", color="green")
-                    axs[0].plot(range(T), act_batch[i, :, 0].cpu().numpy(), label="Ground Truth Action", color="red")
-                    axs[0].plot(range(T), pred[i, :, 0].cpu().numpy(), label="Predicted Action", color="blue", linestyle="--")
+                    axs[0].plot(range(T), unnormalized_obs_ep[:, 0].cpu().numpy(), label="Observation", color="green")
+                    axs[0].plot(range(T), unnormalized_act_ep[:, 0].cpu().numpy(), label="Ground Truth Action", color="red")
+                    axs[0].plot(range(T), unnormalize_prediction[:, 0].cpu().numpy(), label="Predicted Action", color="blue", linestyle="--")
                     axs[0].set_ylabel("Stretch")
                     axs[0].legend()
 
-                    axs[1].plot(range(T), obs_batch[i, :, 3].cpu().numpy(), label="Observation", color="green")
-                    axs[1].plot(range(T), act_batch[i, :, 1].cpu().numpy(), label="Ground Truth Action", color="red")
-                    axs[1].plot(range(T), pred[i, :, 1].cpu().numpy(), label="Predicted Action", color="blue", linestyle="--")
+                    axs[1].plot(range(T), unnormalized_obs_ep[:, 3].cpu().numpy(), label="Observation", color="green")
+                    axs[1].plot(range(T), unnormalized_act_ep[:, 1].cpu().numpy(), label="Ground Truth Action", color="red")
+                    axs[1].plot(range(T), unnormalize_prediction[:, 1].cpu().numpy(), label="Predicted Action", color="blue", linestyle="--")
                     axs[1].set_ylabel("Push")
                     axs[1].legend()
 
                     plt.xlabel("Time Step")
-                    plt.title(f"Episode {i + 1} - Loss: {masked_weighted_loss.item():.4f}")
+                    plt.title(f"Episode {b + 1} - Loss: {masked_weighted_loss.item():.4f}")
                     plt.show()
                     plt.close(fig)
 
     return total_loss / max(total_weight, 1e-8)
 
 if __name__ == "__main__":
-    train = True # Set to False to skip training and only evaluate
+    train = False # Set to False to skip training and only evaluate
     reload_data= False # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
     load_fixing_terminal_in_obs = True # Set to True to load the fixing terminal as an extra input dimension in the observation, False to ignore it
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
     policy_type = "stochastic_mlp"  # stochastic_gru or stochastic_mlp
-    use_encoder = True
+    use_encoder = False
     train_encoder = True
     if not use_encoder:
         train_encoder = False  # if no encoder is used, no need to train it
@@ -317,7 +381,7 @@ if __name__ == "__main__":
     '''train the policy'''
     log_base_dir = "/home/tp2/Documents/kejia/d3rlpy/d3rlpy_logs/Clip_Weighted_BC/"
     if not train:
-        log_stored_folder = "20250807_220600" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
+        log_stored_folder = "20250810_160533" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
         log_dir = os.path.join(log_base_dir, log_stored_folder)
     else:
         log_dir = os.path.join(log_base_dir, time.strftime("%Y%m%d_%H%M%S"))
@@ -379,8 +443,8 @@ if __name__ == "__main__":
                                 save_epoch=10,
                             )
 
-    policy_path = os.path.join(log_dir, "trained_BC_policy.pth")
-    encoder_path = os.path.join(log_dir, "dynamics_encoder.pth")
+    policy_path = os.path.join(log_dir, "best_policy.pth")
+    encoder_path = os.path.join(log_dir, "encoder_epoch_30.pth")
 
     if train:
         # save the policy
@@ -389,9 +453,7 @@ if __name__ == "__main__":
 
         # save the encoder
         torch.save(encoder.state_dict(), encoder_path)
-        encoder.set_export(True)  # Enable ONNX export
         export_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, "dynamics_encoder.onnx"))
-        encoder.set_export(False)  # Disable ONNX export after saving
 
     '''Evaluate the policy'''
     # load config
