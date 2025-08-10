@@ -143,8 +143,9 @@ class StochasticMLPPolicy(nn.Module):
         super().__init__()
         self.obs_dim = obs_dim
         self.z_dim = z_dim
-        input_dim = obs_dim + z_dim  # Combined input
-
+        self.seq_len = seq_len
+        input_dim = obs_dim*self.seq_len + z_dim  # Combined input
+        
         layers = []
         dims = [input_dim] + list(hidden_dims)
         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
@@ -153,26 +154,42 @@ class StochasticMLPPolicy(nn.Module):
 
         self.mean_head = nn.Linear(dims[-1], act_dim)
         self.log_std = nn.Parameter(torch.zeros(act_dim))
+        
+    def _pack(self, obs, z_dyn):
+        """
+        obs: (B, T, obs_dim)
+        z_dyn: (B, 1, z_dim) or None
+        returns flattened input (B, seq_len*obs_dim [+ z_dim])
+        """
+        B, T, D = obs.shape
+        assert D == self.obs_dim, f"Expected obs_dim={self.obs_dim}, got {D}"
+
+        if T != self.seq_len:
+            raise ValueError(f"Input sequence length {T} does not match expected seq_len {self.seq_len}.")
+
+        x = obs.reshape(obs.size(0), -1)          # (B, T*D)
+
+        if z_dyn is None: # z_dyn is only None when z_dim = 0
+            x = x
+        else:
+            z_dyn = z_dyn.view(B, -1)  # (B, z_dim)
+            x = torch.cat([x, z_dyn], dim=-1)
+        return x
 
     def forward(self, obs, z_dyn=None):
-        # obs: (B, 1, obs_dim),
+        # obs: (B, T, obs_dim),
         # z_dyn: (B, 1, z_dim)
-        if z_dyn is None: # z_dyn is only None when z_dim = 0
-            x = obs
-        else:
-            x = torch.cat([obs, z_dyn], dim=-1)
+        x = self._pack(obs, z_dyn)
         latent = self.encoder(x)
         mean = self.mean_head(latent)
         return mean
 
     def get_dist(self, obs, z_dyn=None):
-        if z_dyn is None:
-            x = obs
-        else:
-            x = torch.cat([obs, z_dyn], dim=-1)
+        x = self._pack(obs, z_dyn)
         latent = self.encoder(x)
         mean = self.mean_head(latent)
-        std = torch.exp(self.log_std)
+        log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)  # σ in [~0.007, ~7.4]
+        std = torch.exp(log_std).expand_as(mean)
         return torch.distributions.Normal(mean, std)
     
     def get_z_dim(self):

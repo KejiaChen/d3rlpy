@@ -10,7 +10,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.optim as optim
 import torch.nn.functional as F
 from policies import *
-from dynamics_encoder_decoder import DynamicsRNNEncoder, masked_mse, export_encoder_to_onnx
+from dynamics_encoder_decoder import DynamicsRNNEncoder, masked_mse, export_dynamic_encoder_to_onnx
 from return_functions import *
 
 from build_episode_dataset import load_trajectories, normalize_obs, unnormalize_obs, normalize_acts, unnormalize_acts
@@ -111,12 +111,12 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
 
         # 2. Encoder windowed input
         if use_encoder:
-            if encoder_window_length > 1:
+            if encoder_window_length >= 1:
                 windowed_input = get_obs_padded_window(obs_padded, t, encoder_window_length, window_obs_dim=obs_dim-1)  # (B, window_len, obs_dim-1)
                 z_dyn, encoder_h = encoder(windowed_input, encoder_h)
-            else:
-                single_input = obs_step[:, :-1].unsqueeze(1)  # (B, 1, obs_dim-1)
-                z_dyn, encoder_h = encoder(single_input, encoder_h)
+            # else:
+            #     single_input = obs_step[:, :-1].unsqueeze(1)  # (B, 1, obs_dim-1)
+            #     z_dyn, encoder_h = encoder(single_input, encoder_h)
             if t >= terminal_index[0].item():
                 z_dyn = torch.zeros_like(z_dyn)
             
@@ -133,22 +133,22 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
             else:
                 pred_step, policy_h = policy(obs_step, z_dyn, policy_h)  # (B, act_dim)
         elif policy_type == "stochastic_mlp":
-            if policy_window_length > 1:
+            if policy_window_length >= 1:
                 windowed_input = get_obs_padded_window(obs_padded, t, policy_window_length, window_obs_dim=obs_dim)
                 if train:
                     pred_dist_t = policy.get_dist(windowed_input, z_dyn)
                 else:
                     pred_step = policy(windowed_input, z_dyn)
-            else:
-                single_input = obs_step.unsqueeze(1)  # (B, 1, obs_dim)
-                if train:
-                    pred_dist_t = policy.get_dist(single_input, z_dyn)
-                else:
-                    pred_step = policy(single_input, z_dyn)
+            # else:
+            #     single_input = obs_step.unsqueeze(1)  # (B, 1, obs_dim)
+            #     if train:
+            #         pred_dist_t = policy.get_dist(single_input, z_dyn)
+            #     else:
+            #         pred_step = policy(single_input, z_dyn)
 
         if train:
-            single_act = act_step.unsqueeze(1)  # (B, act_dim)
-            log_prob_t = pred_dist_t.log_prob(single_act).sum(-1) # (B,)
+            # single_act = act_step.unsqueeze(1)  # (B, act_dim)
+            log_prob_t = pred_dist_t.log_prob(act_step).sum(-1) # (B,)
             log_prob_seq.append(log_prob_t)
             entropy = pred_dist_t.entropy().sum(-1)          # per-step, sum over dims
             entropy_seq.append(entropy)
@@ -173,7 +173,8 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
         entropy_reg = entropy_masked.mean()
         final_loss = weighted_loss - entropy_coef * entropy_reg
     else:
-        pred = torch.cat(pred_seq, dim=1)  # (B, T, act_dim)
+        # pred = torch.cat(pred_seq, dim=1)  # (B, T, act_dim)
+        pred = torch.stack(pred_seq, dim=1)  # (B, T, act_dim)
         forward_output = pred
         # denormalize actions in evaluation for more realistic metrics
         unnormalized_pred = unnormalize_acts(pred)
@@ -228,7 +229,7 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_wind
                 encoder_path = os.path.join(log_dir, f"encoder_epoch_{epoch}.pth")
                 torch.save(encoder.state_dict(), encoder_path)
                 # encoder.set_export(True)  # Enable ONNX export
-                export_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, f"trained_BC_encoder_{epoch}.onnx"))   
+                export_dynamic_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, f"trained_BC_encoder_{epoch}.onnx"))   
                 print(f"Saved encoder at {encoder_path}")
                 # encoder.set_export(False)  # Disable ONNX export after saving
 
@@ -321,7 +322,7 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
     return total_loss / max(total_weight, 1e-8)
 
 if __name__ == "__main__":
-    train = False # Set to False to skip training and only evaluate
+    train = True # Set to False to skip training and only evaluate
     reload_data= False # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
     load_fixing_terminal_in_obs = True # Set to True to load the fixing terminal as an extra input dimension in the observation, False to ignore it
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
@@ -333,7 +334,7 @@ if __name__ == "__main__":
     train_epochs = 200
     learning_rate = 1e-3
     batch_size = 8
-    seq_window_len = 1 #  30  # sequence length for the episode window dataset. Corresponding number of control loops: seq_window_len*update_step
+    seq_window_len = 30 #  30  # sequence length for the episode window dataset. Corresponding number of control loops: seq_window_len*update_step
     encoder_window_length = 0  # length of the sliding window for the encoder, -1 to use full input sequence
     encoder_z_dim = 16
     encoder_hidden_dim = 64
@@ -434,12 +435,12 @@ if __name__ == "__main__":
 
         # save the encoder
         torch.save(encoder.state_dict(), encoder_path)
-        export_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, "dynamics_encoder.onnx"))
+        export_dynamic_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, "dynamics_encoder.onnx"))
 
     '''---------------------------------------------Evaluate the policy-------------------------------------'''
     # paths
     if not train:
-        log_stored_folder = "20250810_201224" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
+        log_stored_folder = "20250810_202811" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
         log_dir = os.path.join(log_base_dir, log_stored_folder)
     
     policy_path = os.path.join(log_dir, "best_policy.pth")
@@ -462,6 +463,7 @@ if __name__ == "__main__":
     reload_encoder_z_dim = reload_config.get("encoder_z_dim", encoder_z_dim)
     reload_encoder_hidden_dim = reload_config.get("encoder_hidden_dim", encoder_hidden_dim)
     reload_policy_hidden_dim = reload_config.get("policy_hidden_dim", policy_hidden_dim)
+    reload_seq_window_len = reload_config.get("seq_window_len", seq_window_len)
 
     # load the policy
     encoder = DynamicsRNNEncoder(input_dim=obs_dim-1, z_dim=reload_encoder_z_dim, hidden_dim=reload_encoder_hidden_dim).to(device)
@@ -492,7 +494,7 @@ if __name__ == "__main__":
         reload_policy,
         encoder,
         val_dataloader,
-        policy_window_length=seq_window_len,  # -1 to use full input sequence, otherwise use a sliding window of length policy_window_length
+        policy_window_length=reload_seq_window_len,  # -1 to use full input sequence, otherwise use a sliding window of length policy_window_length
         encoder_window_length=encoder_window_length, # -1 to use full input sequence, otherwise use a sliding window of length encoder_window_length
         loss_fn=masked_mse,
         policy_type=reload_policy_type,
