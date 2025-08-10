@@ -1,3 +1,4 @@
+from matplotlib.pylab import mean
 import torch
 import torch.nn as nn
 import torch.distributions as D
@@ -6,44 +7,44 @@ import torch.distributions as D
 def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic_mlp", export_path="mlp_policy.onnx", step_wise=False):
     policy.eval()
     if policy_type == "stochastic_mlp":
-        if seq_len is not None and seq_len > 1:
-            dummy_input = torch.randn(1, 1, seq_len, obs_dim)
-            dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
+        # if seq_len is not None and seq_len > 1:
+        #     dummy_input = torch.randn(1, 1, seq_len, obs_dim)
+        #     dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
 
-            dummy_input, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
+        # #     dummy_input, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
 
-            torch.onnx.export(
-                policy, 
-                (dummy_input, dummy_z_dyn),
-                export_path,
-                export_params=True,
-                opset_version=11,
-                input_names=["input", "z_dyn"],
-                output_names=["output"],
-                dynamic_axes={
-                    "input": {0: "batch_size"},  # support variable batch size
-                    "output": {0: "batch_size"}
-                }
-            )
-        else:
-            dummy_input = torch.randn(1, 1, obs_dim)  # 3D input: (batch_size, seq_len, obs_dim) to match the expected input shape in cpp
-            dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
+        #     torch.onnx.export(
+        #         policy, 
+        #         (dummy_input, dummy_z_dyn),
+        #         export_path,
+        #         export_params=True,
+        #         opset_version=11,
+        #         input_names=["input", "z_dyn"],
+        #         output_names=["output"],
+        #         dynamic_axes={
+        #             "input": {0: "batch_size"},  # support variable batch size
+        #             "output": {0: "batch_size"}
+        #         }
+        #     )
+        # else:
+        dummy_input = torch.randn(1, seq_len, obs_dim)  # 3D input: (batch_size, seq_len, obs_dim) to match the expected input shape in cpp
+        dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
 
-            dummy_input, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
+        dummy_input, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
 
-            torch.onnx.export(
-                policy, 
-                (dummy_input, dummy_z_dyn),  # Tuple of inputs
-                export_path,
-                export_params=True,
-                opset_version=11,
-                input_names=["input", "z_dyn"],
-                output_names=["output"],
-                dynamic_axes={
-                    "input": {0: "batch_size"},  # support variable batch size
-                    "output": {0: "batch_size"}
-                }
-            )
+        torch.onnx.export(
+            policy, 
+            (dummy_input, dummy_z_dyn),  # Tuple of inputs
+            export_path,
+            export_params=True,
+            opset_version=11,
+            input_names=["input", "z_dyn"],
+            output_names=["output"],
+            dynamic_axes={
+                "input": {0: "batch_size"},  # support variable batch size
+                "output": {0: "batch_size"}
+            }
+        )
     elif policy_type == "gru":
         if step_wise:
             dummy_input = torch.randn(1, obs_dim)
@@ -138,7 +139,7 @@ class MLPSeqPolicy(nn.Module):
             raise ValueError(f"Unsupported obs_seq shape: {obs_seq.shape}")
     
 class StochasticMLPPolicy(nn.Module):
-    def __init__(self, obs_dim, act_dim, z_dim=32, hidden_dims=(128, 128)):
+    def __init__(self, obs_dim, act_dim, seq_len, z_dim=32, hidden_dims=(128, 128)):
         super().__init__()
         self.obs_dim = obs_dim
         self.z_dim = z_dim
@@ -154,7 +155,8 @@ class StochasticMLPPolicy(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(act_dim))
 
     def forward(self, obs, z_dyn=None):
-        # obs: (B, obs_dim), z_dyn: (B, z_dim)
+        # obs: (B, 1, obs_dim),
+        # z_dyn: (B, 1, z_dim)
         if z_dyn is None: # z_dyn is only None when z_dim = 0
             x = obs
         else:
@@ -333,3 +335,85 @@ class StochasticRNNPolicyStepwise(nn.Module):
     
     def get_hidden_dim(self):
         return self.hidden_dim
+    
+
+# class StochasticMLPPolicy(nn.Module):
+#     def __init__(self, obs_dim, act_dim, seq_len=1, z_dim=32, hidden_dims=(128, 128)):
+#         super().__init__()
+#         self.obs_dim = obs_dim
+#         self.z_dim = z_dim
+#         self.seq_len = seq_len
+#         if self.seq_len == 0:
+#             self.seq_len = 1
+#         # input_dim = obs_dim + z_dim  # Combined input
+#         input_dim = self.seq_len * obs_dim + z_dim
+
+#         layers = []
+#         dims = [input_dim] + list(hidden_dims)
+#         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
+#             layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
+#         self.backbone = nn.Sequential(*layers)
+
+#         self.mean_head = nn.Linear(dims[-1], act_dim)
+#         self.log_std = nn.Parameter(torch.zeros(act_dim))
+    
+#     def _ensure_window(self, obs):
+#         """
+#         obs: (B, T, obs_dim)
+#         returns: (B, self.seq_len, obs_dim)
+#         Pads by repeating the earliest frame if too short; takes the last seq_len if too long.
+#         """
+#         B, T, D = obs.shape
+#         assert D == self.obs_dim, f"Expected obs_dim={self.obs_dim}, got {D}"
+
+#         if T != self.seq_len:
+#             raise ValueError(f"Input sequence length {T} does not match expected seq_len {self.seq_len}.")
+
+#         # if T == self.seq_len:
+#         #     return obs
+#         # elif T > self.seq_len:
+#         #     return obs[:, -self.seq_len:, :]  # keep most recent seq_len
+#         # else:
+#         #     # pad at the front with the earliest available frame
+#         #     pad_needed = self.seq_len - T
+#         #     pad = obs[:, :1, :].expand(B, pad_needed, D)
+#         #     return torch.cat([pad, obs], dim=1)
+#         return obs
+        
+#     def _pack(self, obs, z_dyn):
+#         """
+#         obs: (B, T, obs_dim)
+#         z_dyn: (B, z_dim) or None
+#         returns flattened input (B, seq_len*obs_dim [+ z_dim])
+#         """
+#         obs_win = self._ensure_window(obs)                # (B, S, D)
+#         x = obs_win.reshape(obs_win.size(0), -1)          # (B, S*D)
+#         # if self.z_dim > 0 and z_dyn is not None:
+#         #     x = torch.cat([x, z_dyn], dim=-1)             # (B, S*D + z_dim)
+
+#         if z_dyn is None:
+#             z_dyn = obs.new_zeros(obs.size(0), self.export_z_dim)
+
+#         x = torch.cat([x, z_dyn], dim=-1)
+#         return x
+    
+#     def forward(self, obs, z_dyn=None):
+#         '''
+#         obs: (B, T, obs_dim)
+#         z_dyn: (B, z_dim)
+#         mean: (B, act_dim)
+#         '''
+#         x = self._pack(obs, z_dyn)  # (B, seq_len * obs_dim [+ z_dim])
+#         latent = self.backbone(x)
+#         mean = self.mean_head(latent)
+#         return mean
+     
+#     def get_dist(self, obs, z_dyn=None):
+#         mean = self.forward(obs, z_dyn)  # (B, act_dim)
+#         # std = torch.exp(self.log_std)
+#         log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)  # σ in [~0.007, ~7.4]
+#         std = torch.exp(log_std).expand_as(mean)
+#         return torch.distributions.Normal(mean, std)
+    
+#     def get_z_dim(self):
+#         return self.z_dim
