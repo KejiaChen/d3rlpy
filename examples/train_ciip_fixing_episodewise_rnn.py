@@ -40,7 +40,7 @@ def load_slope_distribution(slope_file):
         for key, value in slope_raw_dict.items():
             if label in value["config_labels"]:
                 slope_distribution[label]["mean"] = value["slope_mean_list"][-1]
-                slope_distribution[label]["sigma"] = value["slope_var_list"][-1]
+                slope_distribution[label]["sigma"] = np.sqrt(value["slope_var_list"][-1])
                 break
     return slope_distribution
 
@@ -62,9 +62,14 @@ def slope_z_wrapper(labels):
     labels_np = labels.cpu().numpy()-1
     mu = torch.from_numpy(SLOPE_MEANS[labels_np]).to(labels.device)      # (B,)
     sigma = torch.from_numpy(SLOPE_SIGMAS[labels_np]).to(labels.device)  # (B,)
-    c = torch.from_numpy(np.random.uniform(0.5, 1.0, size=labels_np.shape)).to(labels.device)  # (B,)
-    z = torch.stack([mu - c * sigma, mu, mu + c * sigma], dim=1).float()   # (B, 3)
+    c = torch.from_numpy(np.random.uniform(0.1, 0.2, size=labels_np.shape)).to(labels.device)  # (B,)
+    z = torch.stack([mu - 2*c * sigma, mu - c * sigma, mu, mu + c * sigma,  mu + 2*c* sigma], dim=1).float()   # (B, 5)
+
+    # normalize z to [0, 1] range
+    max_contact_slope = 0.02
+    z = z/max_contact_slope
     return z
+    # return torch.ones_like(z)
 
     # for label in labels:
     #     label_int = int(label.item())
@@ -90,40 +95,63 @@ def collate_variable_episodes(batch, include_terminal=False):
         mask: (B, T_max) — bool
         lengths: (B,) — original episode lengths
     """
-    obs_list, act_list, weights, lengths, labels = [], [], [], [], []
+    obs_list, act_list, weights, original_lengths, fixing_lengths, labels = [], [], [], [], [], []
 
     for data in batch:
         if include_terminal:
             obs, act, weight, terminals, label = data
             terminals = terminals.view(-1, 1)
+            # print("max stretching velocity:", abs(obs[:, 2]).max().item(), "min stretching velocity:", abs(obs[:, 2]).min().item())
+            # print("max pushing velocity:", abs(obs[:, 5]).max().item(), "min pushing velocity:", abs(obs[:, 5]).min().item())
             obs = normalize_obs(obs)
             obs = torch.cat([obs, terminals], dim=-1)
             act = normalize_acts(act)
+            original_ep_len = obs.shape[0]
             terminal_idx = (terminals.squeeze() == 1).nonzero(as_tuple=True)[0]
-            ep_len = terminal_idx[0].item() + 1 if len(terminal_idx) > 0 else obs.shape[0]
+            fixing_ep_len = terminal_idx[0].item() + 1 if len(terminal_idx) > 0 else obs.shape[0]
+            last_obs = obs[-1, :-1].unsqueeze(0)  # last observation without terminal
+            # print(f"Original episode length: {original_ep_len}, Fixing episode length: {fixing_ep_len}")
         else:
             obs, act, weight, label = data
-            ep_len = obs.shape[0]
+            original_ep_len = obs.shape[0]
+            fixing_ep_len = original_ep_len
 
         obs_list.append(obs)
         act_list.append(act)
         weights.append(weight)
-        lengths.append(ep_len)
+        original_lengths.append(original_ep_len)
+        fixing_lengths.append(fixing_ep_len)
         labels.append(label)
 
-    lengths = torch.tensor(lengths)
+    original_lengths = torch.tensor(original_lengths, dtype=torch.int64)
+    fixing_lengths = torch.tensor(fixing_lengths, dtype=torch.int64)
     labels = torch.tensor(labels, dtype=torch.int64)
     obs_padded = pad_sequence(obs_list, batch_first=True)
     act_padded = pad_sequence(act_list, batch_first=True)
-    policy_mask = torch.ones(obs_padded.shape[0], obs_padded.shape[1], dtype=torch.bool)
-    encoder_mask = torch.arange(obs_padded.size(1)).unsqueeze(0) < lengths.unsqueeze(1)  # (B, T_max)
 
-    return obs_padded, act_padded, torch.tensor(weights), policy_mask, encoder_mask, lengths, labels
+    B, T_max = obs_padded.size(0), obs_padded.size(1)
+    time = torch.arange(T_max).unsqueeze(0)                    # (1, T_max)      
+    original_mask = time < original_lengths.unsqueeze(1) # (B, T_max)
+    fitting_mask = time < fixing_lengths.unsqueeze(1)  # (B, T_max)
+    # policy_mask = torch.ones(obs_padded.shape[0], obs_padded.shape[1], dtype=torch.bool)
+    policy_mask = original_mask.clone()  # (B, T_max)
+    encoder_mask = fitting_mask.clone()
+    # policy_mask = torch.ones(obs_padded.shape[0], obs_padded.shape[1], dtype=torch.bool)
+    # policy_mask = torch.arange(obs_padded.size(1)).unsqueeze(0) < lengths.unsqueeze(1)  # (B, T_max)
+    # encoder_mask = torch.arange(obs_padded.size(1)).unsqueeze(0) < lengths.unsqueeze(1)  # (B, T_max)
+
+    # pad last dim of obs_padded (terminal) with 1
+    if include_terminal:
+        terminals_padded = obs_padded[..., -1]                             # (B, T_max)
+        terminals_padded = terminals_padded.masked_fill(~encoder_mask, 1.0)                    # pads -> 1.0
+        obs_padded[..., -1] = terminals_padded
+
+    return obs_padded, act_padded, torch.tensor(weights), policy_mask, encoder_mask, original_lengths, fixing_lengths, labels
 
 
 def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, policy_window_length, encoder_window_length, 
                                              policy_mask, encoder_mask, policy, encoder, labels,
-                                             policy_type="gru", use_encoder="gru", train=True):
+                                             policy_type="gru", use_encoder="gru", train=True, z_dummy=None):
     """
     Args:
         obs_seq:      (B, T, S, obs_dim)
@@ -143,6 +171,11 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
     pred_seq = []
     entropy_seq = []
 
+    if use_encoder == "slope": # slope z should be static for the whole episode
+        z_dyn = slope_z_wrapper(labels)
+        z_dyn = z_dyn.unsqueeze(1)  # (B, 1, z_dim)
+        # z_dyn = z_dummy
+
     for t in range(T):
         # 1. One-step observation
         obs_step = obs_padded[:, t, :]  # (B, 1, obs_dim)
@@ -161,10 +194,7 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
             
             # TODO: temp solution
             # z_dyn = z_dyn.squeeze(1)
-        elif use_encoder == "slope":
-            z_dyn = slope_z_wrapper(labels)
-            z_dyn = z_dyn.unsqueeze(1)  # (B, 1, z_dim)
-        else: # null
+        elif use_encoder == "null": # null
             z_dyn = None
             encoder_h = None
 
@@ -228,8 +258,9 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
     return forward_output, final_loss, weight_masked.sum().item()
 
 def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_window_len, encoder_window_len, num_epochs=50, batch_size=8, lr=1e-3, policy_type="deterministic", use_encoder="gru", log_dir=None, save_epoch=50):
-    encoder.train()
     policy.train()
+    if encoder is not None:
+        encoder.train()
     
     optimizer = optim.Adam(policy.parameters(), lr=lr)
 
@@ -239,14 +270,15 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_wind
     patience_counter = 0      # Counter for early stopping
 
     for epoch in range(num_epochs):
-        encoder.train()
+        if encoder is not None:
+            encoder.train()
         policy.train()  # Set policy to training mode
 
         epoch_loss = 0.0
 
         total_weight = 0.0
-        for obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths, labels in dataloader:
-            obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths, labels = obs_batch.to(device), act_batch.to(device), weights.to(device), policy_mask.to(device), encoder_mask.to(device), lengths.to(device), labels.to(device)
+        for obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels in dataloader:
+            obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels = obs_batch.to(device), act_batch.to(device), weights.to(device), policy_mask.to(device), encoder_mask.to(device), original_lengths.to(device), fixing_lengths.to(device), labels.to(device)
             optimizer.zero_grad()
             # weighted_loss, batch_weight = compute_weighted_masked_bc_loss(obs_batch, act_batch, weights, lengths, mask, policy, encoder, policy_type)
             policy_pred, weighted_loss, batch_weight = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_len, encoder_window_len, 
@@ -270,12 +302,13 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_wind
                 export_policy_to_onnx(policy, obs_dim, seq_window_len, policy_type=policy_type, export_path=os.path.join(log_dir, f"trained_BC_policy_{epoch}.onnx"), step_wise=True)
                 print(f"Saved policy at {policy_path}")
 
-                encoder_path = os.path.join(log_dir, f"encoder_epoch_{epoch}.pth")
-                torch.save(encoder.state_dict(), encoder_path)
-                # encoder.set_export(True)  # Enable ONNX export
-                export_dynamic_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, f"trained_BC_encoder_{epoch}.onnx"))   
-                print(f"Saved encoder at {encoder_path}")
-                # encoder.set_export(False)  # Disable ONNX export after saving
+                if encoder is not None:
+                    encoder_path = os.path.join(log_dir, f"encoder_epoch_{epoch}.pth")
+                    torch.save(encoder.state_dict(), encoder_path)
+                    # encoder.set_export(True)  # Enable ONNX export
+                    export_dynamic_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, f"trained_BC_encoder_{epoch}.onnx"))   
+                    print(f"Saved encoder at {encoder_path}")
+                    # encoder.set_export(False)  # Disable ONNX export after saving
 
         # Early stopping logic
         if val_loss < best_loss:
@@ -287,9 +320,10 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_wind
                 torch.save(policy.state_dict(), best_model_path)
                 print(f"Best model saved at epoch {epoch} with validation loss {best_loss:.8f}")
 
-                best_encoder_path = os.path.join(log_dir, "best_encoder.pth")
-                torch.save(encoder.state_dict(), best_encoder_path)
-                print(f"Best encoder saved at epoch {epoch} with validation loss {best_loss:.8f}")
+                if encoder is not None:
+                    best_encoder_path = os.path.join(log_dir, "best_encoder.pth")
+                    torch.save(encoder.state_dict(), best_encoder_path)
+                    print(f"Best encoder saved at epoch {epoch} with validation loss {best_loss:.8f}")
         else:
             patience_counter += 1
             print(f"No improvement for {patience_counter} epochs (best loss: {best_loss:.8f})")
@@ -319,24 +353,36 @@ def get_obs_padded_window(obs_batch, t, window_size, window_obs_dim=6):
 def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_length=30, encoder_window_length=30, policy_type="gru", use_encoder="gru", if_plot=False):
     # batch size = 1 for evaluation
     policy.eval()
-    encoder.eval()
+    if encoder is not None:
+        encoder.eval()
     total_loss = 0.0
     total_weight = 0.0
 
+    # total_loss2 = 0.0
+    # total_weight2 = 0.0
+
     with torch.no_grad():
-        for obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths, labels in val_loader:
+        for obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels in val_loader:
             obs_batch = obs_batch.to(device)       # (1, T, obs_dim)
             act_batch = act_batch.to(device)       # (1, T, act_dim)
             weights = weights.to(device)           # (1,)
             policy_mask = policy_mask.to(device)   # (1, T)
             encoder_mask = encoder_mask.to(device) # (1, T)
-            lengths = lengths.to(device)           # (1,)
+            original_lengths = original_lengths.to(device)           # (1,)
+            fixing_lengths = fixing_lengths.to(device)           # (1,)
             labels = labels.to(device)             # (1,)
 
             pred, masked_weighted_loss, masked_weight = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_length, encoder_window_length,
-                                                                                                policy_mask, encoder_mask, policy, encoder, labels, policy_type, use_encoder, train=False)
+                                                                                                policy_mask, encoder_mask, policy, encoder, labels, policy_type, use_encoder, train=False,
+                                                                                                z_dummy=torch.zeros((obs_batch.size(0), 1, 5), device=device))  # z_dummy for slope encoder
             total_loss += masked_weighted_loss.item()
             total_weight += masked_weight
+
+            # pred2, masked_weighted_loss2, masked_weight2 = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_length, encoder_window_length,
+            #                                                                                     policy_mask, encoder_mask, policy, encoder, labels, policy_type, use_encoder, train=False,
+            #                                                                                     z_dummy=torch.ones((obs_batch.size(0), 1, 5), device=device))  # z_dummy for slope encoder
+            # total_loss2 += masked_weighted_loss2.item()
+            # total_weight2 += masked_weight2
 
             # Optional visualization
             if if_plot:
@@ -344,18 +390,21 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
                     unnormalized_obs_ep = unnormalize_obs(obs_batch[b, :, :])
                     unnormalized_act_ep = unnormalize_acts(act_batch[b, :, :])
                     unnormalize_prediction = unnormalize_acts(pred[b, :, :])
+                    # unnormalize_prediction2 = unnormalize_acts(pred2[b, :, :])
 
                     T = unnormalized_obs_ep.size(0)
                     fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
                     axs[0].plot(range(T), unnormalized_obs_ep[:, 0].cpu().numpy(), label="Observation", color="green")
                     axs[0].plot(range(T), unnormalized_act_ep[:, 0].cpu().numpy(), label="Ground Truth Action", color="red")
                     axs[0].plot(range(T), unnormalize_prediction[:, 0].cpu().numpy(), label="Predicted Action", color="blue", linestyle="--")
+                    # axs[0].plot(range(T), unnormalize_prediction2[:, 0].cpu().numpy(), label="Predicted Action (z=1)", color="orange", linestyle="--")
                     axs[0].set_ylabel("Stretch")
                     axs[0].legend()
 
                     axs[1].plot(range(T), unnormalized_obs_ep[:, 3].cpu().numpy(), label="Observation", color="green")
                     axs[1].plot(range(T), unnormalized_act_ep[:, 1].cpu().numpy(), label="Ground Truth Action", color="red")
                     axs[1].plot(range(T), unnormalize_prediction[:, 1].cpu().numpy(), label="Predicted Action", color="blue", linestyle="--")
+                    # axs[1].plot(range(T), unnormalize_prediction2[:, 1].cpu().numpy(), label="Predicted Action (z=1)", color="orange", linestyle="--")
                     axs[1].set_ylabel("Push")
                     axs[1].legend()
 
@@ -367,7 +416,7 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
     return total_loss / max(total_weight, 1e-8)
 
 if __name__ == "__main__":
-    train = False # Set to False to skip training and only evaluate
+    train = True # Set to False to skip training and only evaluate
     reload_data= False # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
     load_fixing_terminal_in_obs = True # Set to True to load the fixing terminal as an extra input dimension in the observation, False to ignore it
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
@@ -381,13 +430,13 @@ if __name__ == "__main__":
     batch_size = 8
     seq_window_len = 30 #  30  # sequence length for the episode window dataset. Corresponding number of control loops: seq_window_len*update_step
     encoder_window_length = 0  # length of the sliding window for the encoder, -1 to use full input sequence
-    encoder_z_dim = 16
     encoder_hidden_dim = 64
-    policy_z_dim = 0
+    encoder_z_dim = 0
     if use_encoder == "slope":
-        policy_z_dim = 3
+        encoder_z_dim = 5
     elif use_encoder == "gru":
-        policy_z_dim = encoder_z_dim
+        encoder_z_dim = 16
+    policy_z_dim = encoder_z_dim
     policy_hidden_dim = 128
     encoder_filename = "predict_f_x_v/best_encoder_2_encoding_True_input_False.pth"
     
@@ -447,11 +496,13 @@ if __name__ == "__main__":
         collate_function = partial(collate_variable_episodes, include_terminal=load_fixing_terminal_in_obs)
         train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_function)
         
-        encoder = DynamicsRNNEncoder(input_dim=obs_dim-1, z_dim=encoder_z_dim, hidden_dim=encoder_hidden_dim).to(device)
-        encoder.load_state_dict(torch.load(f"d3rlpy_logs/Dynamics_Encoder/{encoder_filename}"))
-        if not train_encoder:
-            for param in encoder.parameters(): # freeze encoder parameters
-                param.requires_grad = False
+        encoder = None
+        if use_encoder == "gru":
+            encoder = DynamicsRNNEncoder(input_dim=obs_dim-1, z_dim=encoder_z_dim, hidden_dim=encoder_hidden_dim).to(device)
+            encoder.load_state_dict(torch.load(f"d3rlpy_logs/Dynamics_Encoder/{encoder_filename}"))
+            if not train_encoder:
+                for param in encoder.parameters(): # freeze encoder parameters
+                    param.requires_grad = False
 
         if policy_type == "stochastic_gru":
             policy = StochasticRNNPolicyStepwise(obs_dim, act_dim, z_dim=policy_z_dim, hidden_dim=policy_hidden_dim).to(device)
@@ -483,13 +534,14 @@ if __name__ == "__main__":
         export_policy_to_onnx(policy, obs_dim, seq_window_len, policy_type=policy_type, export_path=os.path.join(log_dir, "trained_BC_policy.onnx"), step_wise=True)
 
         # save the encoder
-        torch.save(encoder.state_dict(), encoder_path)
-        export_dynamic_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, "dynamics_encoder.onnx"))
+        if encoder is not None:
+            torch.save(encoder.state_dict(), encoder_path)
+            export_dynamic_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, "dynamics_encoder.onnx"))
 
     '''---------------------------------------------Evaluate the policy-------------------------------------'''
     # paths
     if not train:
-        log_stored_folder = "20250811_110235" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
+        log_stored_folder = "20250812_162458" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
         log_dir = os.path.join(log_base_dir, log_stored_folder)
     
     policy_path = os.path.join(log_dir, "best_policy.pth")
@@ -514,12 +566,6 @@ if __name__ == "__main__":
     reload_policy_hidden_dim = reload_config.get("policy_hidden_dim", policy_hidden_dim)
     reload_seq_window_len = reload_config.get("seq_window_len", seq_window_len)
 
-    # load the policy
-    encoder = DynamicsRNNEncoder(input_dim=obs_dim-1, z_dim=reload_encoder_z_dim, hidden_dim=reload_encoder_hidden_dim).to(device)
-    encoder.load_state_dict(torch.load(f"d3rlpy_logs/Dynamics_Encoder/{encoder_filename}"))
-    encoder.eval()  # Encoder is used for feature extraction only
-    # encoder.set_export(True)
-
     # # validae encoder onnx model
     # import onnx
     # encoder_onnx_path = os.path.join(log_dir, "dynamics_encoder.onnx")
@@ -527,11 +573,12 @@ if __name__ == "__main__":
     # print([i.name for i in encoder_onnx_model.graph.input])
     # print([i.name for i in encoder_onnx_model.graph.output])
 
-    reload_policy_z_dim = 0
-    if reload_use_encoder == "slope":
-        reload_policy_z_dim = 3
-    elif reload_use_encoder == "gru":
-        reload_policy_z_dim = reload_encoder_z_dim
+    encoder = None
+    reload_policy_z_dim = reload_encoder_z_dim
+    if reload_use_encoder == "gru":
+        encoder = DynamicsRNNEncoder(input_dim=obs_dim-1, z_dim=reload_encoder_z_dim, hidden_dim=reload_encoder_hidden_dim).to(device)
+        encoder.load_state_dict(torch.load(f"d3rlpy_logs/Dynamics_Encoder/{encoder_filename}"))
+        encoder.eval()  # Encoder is used for feature extraction only
     if reload_policy_type == "stochastic_gru":
         reload_policy = StochasticRNNPolicyStepwise(obs_dim, act_dim, z_dim=reload_policy_z_dim, hidden_dim=reload_policy_hidden_dim).to(device)  # With dynamics encoding
     elif reload_policy_type == "stochastic_mlp":
