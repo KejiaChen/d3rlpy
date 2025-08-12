@@ -26,32 +26,32 @@ SETUP_LABELS = {"R_L_H_1_C_L_1": 1,
                 "W_S_M_1_C_S_2": 12}
 
 def normalize_obs(obs):
+    force_scale = 30.0
+    distance_scale = 0.1
+    velocity_scale = 0.2
+
     if obs.dim() == 2:
         obs = obs.clone()
         # Force: [0, 30] → scale to [0, 1]
-        obs[:, 0] /= 30.0  # stretch force
-        obs[:, 3] /= 30.0  # push force
+        obs[:, 0] /= force_scale
+        obs[:, 3] /= force_scale
 
         # Distance: normalize using global mean/std or empirical range
         # Estimate these from your dataset (preprocess)
-        distance_scale = 0.05  # or use empirical max (e.g., 0.015 or 0.025)
         obs[:, 1] /= distance_scale  # stretch displacement
         obs[:, 4] /= distance_scale  # push displacement
         # # Velocity: estimate from data (e.g., max ~0.05 m/s)
-        velocity_scale = 0.1
         obs[:, 2] /= velocity_scale
         obs[:, 5] /= velocity_scale
     elif obs.dim() == 3:
         obs = obs.clone()
         # Force: [0, 30] → scale to [0, 1]
-        obs[:, :, 0] /= 30.0  # stretch force
-        obs[:, :, 3] /= 30.0  # push force
+        obs[:, :, 0] /= force_scale  # stretch force
+        obs[:, :, 3] /= force_scale  # push force
         # Distance: normalize using global mean/std or empirical range
-        distance_scale = 0.05  # or use empirical max (e.g., 0.015 or 0.025)
-        obs[:, :, 1] /= distance_scale
+        obs[:, :, 1] /= distance_scale  # stretch displacement
         obs[:, :, 4] /= distance_scale  # push displacement
         # Velocity: estimate from data (e.g., max ~0.05 m/s)
-        velocity_scale = 0.1
         obs[:, :, 2] /= velocity_scale
         obs[:, :, 5] /= velocity_scale
     else:
@@ -59,30 +59,30 @@ def normalize_obs(obs):
     return obs
 
 def unnormalize_obs(normalized_obs):
+    force_scale = 30.0
+    distance_scale = 0.1
+    velocity_scale = 0.2
+
     if normalized_obs.dim() == 2:
         obs = normalized_obs.clone()
         # Force: [0, 1] → scale to [0, 30]
-        obs[:, 0] *= 30.0
-        obs[:, 3] *= 30.0
+        obs[:, 0] *= force_scale
+        obs[:, 3] *= force_scale
         # Distance: scale back using global mean/std or empirical range
-        distance_scale = 0.05
         obs[:, 1] *= distance_scale  # stretch displacement
         obs[:, 4] *= distance_scale
         # Velocity: scale back using estimated max (e.g., 0.1 m/s)
-        velocity_scale = 0.1
         obs[:, 2] *= velocity_scale
         obs[:, 5] *= velocity_scale
     elif normalized_obs.dim() == 3:
         obs = normalized_obs.clone()
         # Force: [0, 1] → scale to [0, 30]
-        obs[:, :, 0] *= 30.0
-        obs[:, :, 3] *= 30.0
+        obs[:, :, 0] *= force_scale
+        obs[:, :, 3] *= force_scale
         # Distance: scale back using global mean/std or empirical range
-        distance_scale = 0.05
-        obs[:, :, 1] *= distance_scale
+        obs[:, :, 1] *= distance_scale  # stretch displacement
         obs[:, :, 4] *= distance_scale
         # Velocity: scale back using estimated max (e.g., 0.1 m/s)
-        velocity_scale = 0.1
         obs[:, :, 2] *= velocity_scale
         obs[:, :, 5] *= velocity_scale
     else:
@@ -461,7 +461,7 @@ def load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_
                                             end="ended")
     # load post fixing sensing data
     post_finish_steps = 1000
-    end_index = -(10*1000 - post_finish_steps)  # 10 seconds before the end
+    # end_index = -(10*1000 - post_finish_steps)  # 10 seconds before the end
 
     # pushing
     external_force_y = sorted_record["ForceControl"]['Force']["proj"]
@@ -476,7 +476,8 @@ def load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_
     feedforward_force_x = np.zeros_like(external_force_x_sensor)
     linear_velocity_x = sorted_record["ForceControl"]['LinearVelocity']["x"]
     # TODO: fake distance x because we don't have it in the mios log
-    distance_x = np.ones_like(distance_y) * obs_buffer_raw[-1, 1]
+    # distance_x = np.ones_like(distance_y) * obs_buffer_raw[-1, 1]
+    distance_x = sorted_record["ForceControl"]['Distance']["x"]
 
     post_obs_buffer_raw = np.stack([
         external_force_x_sensor[:post_finish_steps],
@@ -495,9 +496,10 @@ def load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_
     # load fixing result
     fixing_terminal_index = -1
     if fixing_success:
-        fixing_terminal_index = data_loader.get_timestamps()["finished"] - data_loader.get_timestamps()["contacted"]
+        fixing_terminal_index = data_loader.get_timestamps()["finished"] - data_loader.get_timestamps()["sensed"]
+        loading_end_index = fixing_terminal_index + post_finish_steps
 
-    return post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index
+    return post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index, loading_end_index
 
 def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformation_in_return=True, return_fn=None, return_kwargs=None):
     base_dir = os.path.dirname(traj_path)
@@ -505,6 +507,7 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
 
     obs_buffer_raw = np.loadtxt(os.path.join(traj_path, "observations.txt"))  # the last column is supposed to be the terminal, but was not stored correctly in the past
     acts_buffer_raw = np.loadtxt(os.path.join(traj_path, "actions.txt"))
+    terminals_buffer_raw = obs_buffer_raw[:, -1].astype(bool)  # last column is terminal, but was not stored correctly in the past
 
     print(f"Loaded fixing observation with {obs_buffer_raw.shape[0]} steps.")
 
@@ -516,31 +519,42 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
             fixing_success = load_and_preprocess_fixing_result(os.path.join(mios_traj_dir, "fixing_result.json"))
             setup_label = load_setup_label(os.path.join(mios_traj_dir, "parameters.json"))
 
-            if post_sensing:
-                post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index = load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw, fixing_success)
-                if fixing_terminal_index != -1:
-                    fixing_terminal_index = fixing_terminal_index - 30 # Assuming 10 steps were used for communication latency
+    #         if post_sensing:
+    #             post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index, loading_end_index = load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw, fixing_success)
+    #             # if fixing_terminal_index != -1:
+    #             #     fixing_terminal_index = fixing_terminal_index - 30 # Assuming 10 steps were used for communication latency
 
-                obs_buffer_raw = np.concatenate([obs_buffer_raw[:, :6], post_obs_buffer_raw], axis=0)
-                acts_buffer_raw = np.concatenate([acts_buffer_raw, post_acts_buffer_raw], axis=0)
+    #             obs_buffer_raw = np.concatenate([obs_buffer_raw[:, :6], post_obs_buffer_raw], axis=0)
+    #             acts_buffer_raw = np.concatenate([acts_buffer_raw, post_acts_buffer_raw], axis=0)
+    #             # pad terminals_raw to match the new obs_buffer_raw length with the last terminal
+    #             terminals_raw = np.zeros(obs_buffer_raw.shape[0], dtype=bool)
+    #             terminals_raw[:terminals_buffer_raw.shape[0]] = terminals_buffer_raw
 
-                terminals_raw = load_and_preprocess_terminal(traj_path, obs_buffer_raw, acts_buffer_raw, fixing_terminal_index)
-            else:
-                terminals_raw = obs_buffer_raw[:, -1].astype(bool)  # last column is terminal, but was not stored correctly in the past
-                terminals_raw = terminals_raw.reshape(-1)
+    #             # terminals_raw = load_and_preprocess_terminal(traj_path, obs_buffer_raw, acts_buffer_raw, fixing_terminal_index)
+    #         else:
+    #             terminals_raw = terminals_buffer_raw
+    #             terminals_raw = terminals_raw.reshape(-1)
+
+
 
     # load from policy log and downsample
     obs_buffer_downsampled = preprocess_observation(obs_buffer_raw, env_step=env_step)
     acts_buffer_downsampled  = preprocess_action(acts_buffer_raw, env_step=env_step)
     terminals_downsampled = np.concatenate([
-        terminals_raw[::env_step],
-        [terminals_raw[-1]] if (terminals_raw.shape[0]) % env_step != 0 else np.empty(0, dtype=terminals_raw.dtype)
+        terminals_buffer_raw[::env_step],
+        [terminals_buffer_raw[-1]] if (terminals_buffer_raw.shape[0]) % env_step != 0 else np.empty(0, dtype=terminals_buffer_raw.dtype)
     ])
-    if post_sensing:
-        terminal_index_downsampled = fixing_terminal_index // env_step
-    else:
-        terminal_index_downsampled = np.where(terminals_downsampled)[0][0] if np.any(terminals_downsampled) else terminals_downsampled.shape[0] - 1
-        
+    # if post_sensing:
+    #     terminal_index_downsampled = fixing_terminal_index // env_step
+    #     loading_end_index_downsampled = loading_end_index // env_step
+    # else:
+    #     terminal_index_downsampled = np.where(terminals_downsampled)[0][0] if np.any(terminals_downsampled) else terminals_downsampled.shape[0] - 1
+    #     loading_end_index_downsampled = obs_buffer_downsampled.shape[0] - 1
+
+    if fixing_success:
+        terminal_index_downsampled = np.where(terminals_downsampled == True)[0][0] if np.any(terminals_downsampled) else terminals_downsampled.shape[0] - 1
+    loading_end_index_downsampled = obs_buffer_downsampled.shape[0] - 1
+
     print(f"Trajectory {traj_dir} has {obs_buffer_downsampled.shape[0]} steps after downsampling.")
 
     # find start index where forces only rise
@@ -549,6 +563,7 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
     acts_buffer = acts_buffer_downsampled[start_index:]
     terminals_buffer = terminals_downsampled[start_index:]
     terminal_index = terminal_index_downsampled - start_index
+    ending_index = loading_end_index_downsampled - start_index
 
     print(f"Trajectory {traj_dir} starts from index {start_index} after stable start index detection")
     
@@ -574,7 +589,7 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
     #     acts_buffer = np.concatenate([acts_buffer, post_acts_buffer], axis=0)
 
     # plotting
-    plot_force(obs_buffer, acts_buffer, base_dir, traj_dir, terminal_index)
+    plot_force(obs_buffer, acts_buffer, base_dir, traj_dir, terminal_index, ending_index)
     return obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_success, setup_label
 
 def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, load_terminal_in_obs=False):
@@ -655,7 +670,7 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
                             labels=all_labels
                             )  # timeouts are not used in this case
 
-def plot_force(obs, act, base_dir, traj_dir, terminal_index):
+def plot_force(obs, act, base_dir, traj_dir, terminal_index, ending_index):
     import matplotlib.pyplot as plt
 
     # if force_type == 'stretch':
@@ -679,6 +694,7 @@ def plot_force(obs, act, base_dir, traj_dir, terminal_index):
     axs[0].plot(time, obs[:, 1], label=f'Stretch Distance', color='orange')
     axs[0].plot(time, obs[:, 4], label=f'Push Distance', color='blue')
     axs[0].axvline(x=terminal_index, color='red', linestyle='-.', label='Finish')
+    axs[0].axvline(x=ending_index, color='black', linestyle='--', label='End of Dataset')
     axs[0].set_xlabel('Time (ms)')
     axs[0].set_ylabel('Distance from Start (m)')
     axs[0].set_title(f'Distance vs Time')
@@ -689,6 +705,7 @@ def plot_force(obs, act, base_dir, traj_dir, terminal_index):
     axs[1].plot(time, obs[:, 2], label=f'Stretch Velocity', color='orange')
     axs[1].plot(time, obs[:, 5], label=f'Push Velocity', color='blue')
     axs[1].axvline(x=terminal_index, color='red', linestyle='-.', label='Finish')
+    axs[1].axvline(x=ending_index, color='black', linestyle='--', label='End of Dataset')
     axs[1].set_xlabel('Time (ms)')
     axs[1].set_ylabel('Velocity (m/s)')
     axs[1].set_title(f'Velocity vs Time')
@@ -701,6 +718,7 @@ def plot_force(obs, act, base_dir, traj_dir, terminal_index):
     axs[2].plot(time, obs[:, 3], label=f'Ext Push Force', color='blue')
     axs[2].plot(time, act[:, 1], label=f'FF Push Force', linestyle='--', color='blue')
     axs[2].axvline(x=terminal_index, color='red', linestyle='-.', label='Finish')
+    axs[2].axvline(x=ending_index, color='black', linestyle='--', label='End of Dataset')
     axs[2].set_xlabel('Time (ms)')
     axs[2].set_ylabel('Force (N)')
     axs[2].set_title(f'Force vs Time')
