@@ -9,7 +9,7 @@ from return_functions import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def export_encoder_to_onnx(encoder, export_path="dynamics_encoder.onnx"):
+def export_dynamic_encoder_to_onnx(encoder, export_path="dynamics_encoder.onnx"):
     encoder.eval()
     B, T, D = 1, 1, 6  # batch size 1, time steps 100, input dim 6
     x_dummy = torch.randn(B, T, D)
@@ -34,11 +34,17 @@ def export_encoder_to_onnx(encoder, export_path="dynamics_encoder.onnx"):
     )
     print(f"ONNX model exported to {export_path}")
 
-def masked_mse(pred, target, mask):
-    mse = (pred - target) ** 2
-    mse = mse.sum(dim=-1)
-    mse = mse * mask
-    return mse.sum() / mask.sum().clamp(min=1)
+def masked_mse(pred, target, mask, masked_weight=None):
+    se = (pred - target).pow(2).sum(dim=-1)      # (B,T)
+    se_m = se[mask]                               # (N,)
+    if masked_weight is None:
+        denom = mask.sum().clamp_min(1).float()
+        return se_m.sum() / denom
+    else:
+        w = masked_weight.float()                 # already masked to (N,)
+        denom = w.sum().clamp_min(1e-8)
+        return (se_m * w).sum() / denom
+
 
 # --- GRU Encoder for z_dyn ---
 # (f_i, x_i, v_i)-> z_dyn
@@ -121,7 +127,48 @@ class DynamicsRNNEncoder(nn.Module):
     
     def get_hidden_dim(self):
         return self.hidden_dim
+    
+class SysIdRNNEncoder(nn.Module):
+    def __init__(self, obs_dim, act_dim, z_dim=16, hdim=128, hist_len=20):
+        super().__init__()
+        self.hist_len = hist_len # hist_len can be 1 or more
+        in_dim = obs_dim + act_dim
+        self.gru = nn.GRU(in_dim, hdim, batch_first=True)
+        self.fc  = nn.Linear(hdim, z_dim)
 
+    def forward(self, obs_hist, act_hist, h=None):
+        # obs_hist, act_hist: (B, T, D), same T
+        x = torch.cat([obs_hist, act_hist], dim=-1)
+        out, h_next = self.gru(x, h)           # (B, T, hdim)
+        z_t = self.fc(out[:, -1])            # (B, z_dim) from the last step
+        return z_t, h_next
+    
+def export_sysid_encoder_to_onnx(encoder, export_path="sysid_encoder.onnx"):
+    encoder.eval()
+    B, T, obs_dim, act_dim = 1, 1, 6, 2  # batch size 1, time steps 1, input dim 6, action dim 2
+    obs_dummy = torch.randn(B, T, obs_dim)
+    act_dummy = torch.randn(B, T, act_dim)
+    h_dummy = torch.zeros(1, B, encoder.gru.hidden_size)  # (num_layers, batch_size, hidden_dim)
+    obs_dummy, act_dummy, h_dummy = obs_dummy.to(device), act_dummy.to(device), h_dummy.to(device)
+
+    with torch.no_grad():
+        torch.onnx.export(
+            encoder,
+            (obs_dummy, act_dummy, h_dummy),
+            export_path,
+            export_params=True,
+            opset_version=11,
+            input_names=["input_obs", "input_act", "h_in"],
+            output_names=["z_dyn", "h_out"],
+            dynamic_axes = {
+            "input_obs": {0: "batch_size", 1: "seq_len"},
+            "input_act": {0: "batch_size", 1: "seq_len"},
+            "h_in":      {1: "batch_size"},          # (num_layers, B, H)
+            "z_dyn":     {0: "batch_size"},
+            "h_out":     {1: "batch_size"}           # (num_layers, B, H)
+            }
+        )
+    print(f"ONNX model exported to {export_path}")
 
 class FlexibleDynamicsDecoderRNN(nn.Module):
     def __init__(self, obs_dim=2, z_dim=32, state_dim=4, hidden_dim=128, output_dim=4):

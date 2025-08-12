@@ -23,6 +23,61 @@ from functools import partial
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+NUM_LABELS = 12
+
+def load_slope_distribution(slope_file):
+    with open(slope_file, 'r') as f:
+        slope_raw_dict = json.load(f)
+
+    slope_distribution = {}
+
+    for i in range(NUM_LABELS):
+        label = i+1
+        slope_distribution[label] = {
+            "mean": 0.0,
+            "sigma": 1e-10
+        }
+        for key, value in slope_raw_dict.items():
+            if label in value["config_labels"]:
+                slope_distribution[label]["mean"] = value["slope_mean_list"][-1]
+                slope_distribution[label]["sigma"] = value["slope_var_list"][-1]
+                break
+    return slope_distribution
+
+SLOPE_DISTRIBUTION = load_slope_distribution("/home/tp2/Documents/kejia/clip_fixing_dataset/off_policy_4/slope_distribution.json")
+# Precompute arrays for all possible labels (1-based indexing)
+SLOPE_MEANS = np.array([SLOPE_DISTRIBUTION[i+1]["mean"] for i in range(NUM_LABELS)])  # shape: [NUM_LABELS]
+SLOPE_SIGMAS = np.array([SLOPE_DISTRIBUTION[i+1]["sigma"] for i in range(NUM_LABELS)])  # shape: [NUM_LABELS]
+
+def slope_z_wrapper(labels):
+    """
+    Convert labels to z values based on the slope distribution.
+    Args:
+        labels: (B, ) tensor of labels
+        slope_distribution: dict containing mean and sigma for each label
+    Returns:
+        z: (B, 3) tensor of z values
+    """
+    z = []
+    labels_np = labels.cpu().numpy()-1
+    mu = torch.from_numpy(SLOPE_MEANS[labels_np]).to(labels.device)      # (B,)
+    sigma = torch.from_numpy(SLOPE_SIGMAS[labels_np]).to(labels.device)  # (B,)
+    c = torch.from_numpy(np.random.uniform(0.5, 1.0, size=labels_np.shape)).to(labels.device)  # (B,)
+    z = torch.stack([mu - c * sigma, mu, mu + c * sigma], dim=1).float()   # (B, 3)
+    return z
+
+    # for label in labels:
+    #     label_int = int(label.item())
+    #     mu = slope_distribution[label_int]["mean"]
+    #     sigma = slope_distribution[label_int]["sigma"]
+    #     z.append(sigma_slope_z(mu, sigma))
+    # return torch.stack(z, dim=0).to(device)  # (B, 3)
+
+def sigma_slope_z(mu, sigma):
+    # sample c from [0.5, 1]
+    c = np.random.uniform(0.5, 1.0)
+    return torch.Tensor([mu-c*sigma, mu, mu+c*sigma])
+
 def collate_variable_episodes(batch, include_terminal=False):
     """
     Args:
@@ -39,7 +94,7 @@ def collate_variable_episodes(batch, include_terminal=False):
 
     for data in batch:
         if include_terminal:
-            obs, act, weight, terminals, labels = data
+            obs, act, weight, terminals, label = data
             terminals = terminals.view(-1, 1)
             obs = normalize_obs(obs)
             obs = torch.cat([obs, terminals], dim=-1)
@@ -47,44 +102,28 @@ def collate_variable_episodes(batch, include_terminal=False):
             terminal_idx = (terminals.squeeze() == 1).nonzero(as_tuple=True)[0]
             ep_len = terminal_idx[0].item() + 1 if len(terminal_idx) > 0 else obs.shape[0]
         else:
-            obs, act, weight, labels = data
+            obs, act, weight, label = data
             ep_len = obs.shape[0]
 
         obs_list.append(obs)
         act_list.append(act)
         weights.append(weight)
         lengths.append(ep_len)
-        # labels.append(labels)
+        labels.append(label)
 
     lengths = torch.tensor(lengths)
-    # labels = torch.tensor(labels, dtype=torch.int64)
+    labels = torch.tensor(labels, dtype=torch.int64)
     obs_padded = pad_sequence(obs_list, batch_first=True)
     act_padded = pad_sequence(act_list, batch_first=True)
     policy_mask = torch.ones(obs_padded.shape[0], obs_padded.shape[1], dtype=torch.bool)
     encoder_mask = torch.arange(obs_padded.size(1)).unsqueeze(0) < lengths.unsqueeze(1)  # (B, T_max)
 
-    return obs_padded, act_padded, torch.tensor(weights), policy_mask, encoder_mask, lengths
-
-def encoder_forward_pass(obs_padded, obs_step, encoder_h, t, terminal_index, encoder_window_length, obs_dim):
-    if use_encoder:
-        if t >= terminal_index[0].item():
-            z_dyn = torch.zeros_like(z_dyn)
-        if encoder_window_length > 1:
-            windowed_input = get_obs_padded_window(obs_padded, t, encoder_window_length, window_obs_dim=obs_dim-1)  # (B, window_len, obs_dim-1)
-            z_dyn, encoder_h = encoder(windowed_input, encoder_h)
-        else:
-            single_input = obs_step[:, :-1].unsqueeze(1)  # (B, 1, obs_dim-1)
-            z_dyn, encoder_h = encoder(single_input, encoder_h)
-        
-        # TODO: temp solution
-        z_dyn = z_dyn.squeeze(1)
-    else:
-        z_dyn = None
-        encoder_h = None
-    return z_dyn, encoder_h
+    return obs_padded, act_padded, torch.tensor(weights), policy_mask, encoder_mask, lengths, labels
 
 
-def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, policy_window_length, encoder_window_length, policy_mask, encoder_mask, policy, encoder, policy_type="gru", use_encoder=True, train=True):
+def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, policy_window_length, encoder_window_length, 
+                                             policy_mask, encoder_mask, policy, encoder, labels,
+                                             policy_type="gru", use_encoder="gru", train=True):
     """
     Args:
         obs_seq:      (B, T, S, obs_dim)
@@ -98,7 +137,7 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
 
     if policy_type == "stochastic_gru":
         policy_h = policy.init_hidden(batch_size=B, device=obs_padded.device)  # Initialize hidden state
-    if use_encoder:
+    if use_encoder == "gru":
         encoder_h = encoder.init_hidden(batch_size=B, device=obs_padded.device)  # Initialize encoder hidden state
     log_prob_seq = []
     pred_seq = []
@@ -110,7 +149,7 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
         act_step = act_padded[:, t, :]  # (B, 1, act_dim)
 
         # 2. Encoder windowed input
-        if use_encoder:
+        if use_encoder == "gru":
             if encoder_window_length >= 1:
                 windowed_input = get_obs_padded_window(obs_padded, t, encoder_window_length, window_obs_dim=obs_dim-1)  # (B, window_len, obs_dim-1)
                 z_dyn, encoder_h = encoder(windowed_input, encoder_h)
@@ -122,7 +161,10 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
             
             # TODO: temp solution
             # z_dyn = z_dyn.squeeze(1)
-        else:
+        elif use_encoder == "slope":
+            z_dyn = slope_z_wrapper(labels)
+            z_dyn = z_dyn.unsqueeze(1)  # (B, 1, z_dim)
+        else: # null
             z_dyn = None
             encoder_h = None
 
@@ -133,12 +175,14 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
             else:
                 pred_step, policy_h = policy(obs_step, z_dyn, policy_h)  # (B, act_dim)
         elif policy_type == "stochastic_mlp":
+            terminal_t = obs_step[:, -1].unsqueeze(1)  # (B, 1)
+            terminal_t = terminal_t.unsqueeze(1)  # (B, 1, 1)
             if policy_window_length >= 1:
-                windowed_input = get_obs_padded_window(obs_padded, t, policy_window_length, window_obs_dim=obs_dim)
+                windowed_input = get_obs_padded_window(obs_padded, t, policy_window_length, window_obs_dim=obs_dim-1)
                 if train:
-                    pred_dist_t = policy.get_dist(windowed_input, z_dyn)
+                    pred_dist_t = policy.get_dist(windowed_input, terminal_t, z_dyn)
                 else:
-                    pred_step = policy(windowed_input, z_dyn)
+                    pred_step = policy(windowed_input, terminal_t, z_dyn)
             # else:
             #     single_input = obs_step.unsqueeze(1)  # (B, 1, obs_dim)
             #     if train:
@@ -183,7 +227,7 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
         final_loss = weighted_loss
     return forward_output, final_loss, weight_masked.sum().item()
 
-def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_window_len, encoder_window_len, num_epochs=50, batch_size=8, lr=1e-3, policy_type="deterministic", use_encoder=True, log_dir=None, save_epoch=50):
+def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_window_len, encoder_window_len, num_epochs=50, batch_size=8, lr=1e-3, policy_type="deterministic", use_encoder="gru", log_dir=None, save_epoch=50):
     encoder.train()
     policy.train()
     
@@ -201,12 +245,12 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_wind
         epoch_loss = 0.0
 
         total_weight = 0.0
-        for obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths in dataloader:
-            obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths = obs_batch.to(device), act_batch.to(device), weights.to(device), policy_mask.to(device), encoder_mask.to(device), lengths.to(device)
+        for obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths, labels in dataloader:
+            obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths, labels = obs_batch.to(device), act_batch.to(device), weights.to(device), policy_mask.to(device), encoder_mask.to(device), lengths.to(device), labels.to(device)
             optimizer.zero_grad()
             # weighted_loss, batch_weight = compute_weighted_masked_bc_loss(obs_batch, act_batch, weights, lengths, mask, policy, encoder, policy_type)
             policy_pred, weighted_loss, batch_weight = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_len, encoder_window_len, 
-                                                                                   policy_mask, encoder_mask, policy, encoder, policy_type, use_encoder, train=True)
+                                                                                   policy_mask, encoder_mask, policy, encoder, labels, policy_type, use_encoder, train=True)
             weighted_loss.backward()
             optimizer.step()
 
@@ -272,7 +316,7 @@ def get_obs_padded_window(obs_batch, t, window_size, window_obs_dim=6):
 
     return window
 
-def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_length=30, encoder_window_length=30, policy_type="gru", use_encoder=True, if_plot=False):
+def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_length=30, encoder_window_length=30, policy_type="gru", use_encoder="gru", if_plot=False):
     # batch size = 1 for evaluation
     policy.eval()
     encoder.eval()
@@ -280,16 +324,17 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
     total_weight = 0.0
 
     with torch.no_grad():
-        for obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths in val_loader:
+        for obs_batch, act_batch, weights, policy_mask, encoder_mask, lengths, labels in val_loader:
             obs_batch = obs_batch.to(device)       # (1, T, obs_dim)
             act_batch = act_batch.to(device)       # (1, T, act_dim)
             weights = weights.to(device)           # (1,)
             policy_mask = policy_mask.to(device)   # (1, T)
             encoder_mask = encoder_mask.to(device) # (1, T)
             lengths = lengths.to(device)           # (1,)
-            
+            labels = labels.to(device)             # (1,)
+
             pred, masked_weighted_loss, masked_weight = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_length, encoder_window_length,
-                                                                                                policy_mask, encoder_mask, policy, encoder, policy_type, use_encoder, train=False)
+                                                                                                policy_mask, encoder_mask, policy, encoder, labels, policy_type, use_encoder, train=False)
             total_loss += masked_weighted_loss.item()
             total_weight += masked_weight
 
@@ -322,14 +367,14 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
     return total_loss / max(total_weight, 1e-8)
 
 if __name__ == "__main__":
-    train = True # Set to False to skip training and only evaluate
+    train = False # Set to False to skip training and only evaluate
     reload_data= False # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
     load_fixing_terminal_in_obs = True # Set to True to load the fixing terminal as an extra input dimension in the observation, False to ignore it
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
     policy_type = "stochastic_mlp"  # stochastic_gru or stochastic_mlp
-    use_encoder = False
+    use_encoder = "slope" # gru or slope or null
     train_encoder = True
-    if not use_encoder:
+    if use_encoder == "null":
         train_encoder = False  # if no encoder is used, no need to train it
     train_epochs = 200
     learning_rate = 1e-3
@@ -338,7 +383,11 @@ if __name__ == "__main__":
     encoder_window_length = 0  # length of the sliding window for the encoder, -1 to use full input sequence
     encoder_z_dim = 16
     encoder_hidden_dim = 64
-    policy_z_dim = encoder_z_dim if use_encoder else 0  # z_dim for the policy, 0 if no encoder is used
+    policy_z_dim = 0
+    if use_encoder == "slope":
+        policy_z_dim = 3
+    elif use_encoder == "gru":
+        policy_z_dim = encoder_z_dim
     policy_hidden_dim = 128
     encoder_filename = "predict_f_x_v/best_encoder_2_encoding_True_input_False.pth"
     
@@ -407,7 +456,7 @@ if __name__ == "__main__":
         if policy_type == "stochastic_gru":
             policy = StochasticRNNPolicyStepwise(obs_dim, act_dim, z_dim=policy_z_dim, hidden_dim=policy_hidden_dim).to(device)
         elif policy_type == "stochastic_mlp":
-            policy = StochasticMLPPolicy(obs_dim, act_dim, seq_len=seq_window_len, z_dim=policy_z_dim).to(device)
+            policy = StochasticMLPPolicy(obs_dim-1, act_dim, seq_len=seq_window_len, z_dim=policy_z_dim).to(device) # obs_dim excludes the terminal dimension
 
         policy, encoder = train_weighted_bc(
                                 policy,
@@ -440,7 +489,7 @@ if __name__ == "__main__":
     '''---------------------------------------------Evaluate the policy-------------------------------------'''
     # paths
     if not train:
-        log_stored_folder = "20250810_202811" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
+        log_stored_folder = "20250811_110235" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
         log_dir = os.path.join(log_base_dir, log_stored_folder)
     
     policy_path = os.path.join(log_dir, "best_policy.pth")
@@ -459,7 +508,7 @@ if __name__ == "__main__":
         reload_config = json.load(f)
     reload_policy_type = reload_config.get("policy_type", "gru")
     print(f"Reloading policy type: {reload_policy_type}")
-    reload_use_encoder = reload_config.get("use_encoder", False)
+    reload_use_encoder = reload_config.get("use_encoder", "null")
     reload_encoder_z_dim = reload_config.get("encoder_z_dim", encoder_z_dim)
     reload_encoder_hidden_dim = reload_config.get("encoder_hidden_dim", encoder_hidden_dim)
     reload_policy_hidden_dim = reload_config.get("policy_hidden_dim", policy_hidden_dim)
@@ -478,11 +527,15 @@ if __name__ == "__main__":
     # print([i.name for i in encoder_onnx_model.graph.input])
     # print([i.name for i in encoder_onnx_model.graph.output])
 
-    reload_policy_z_dim = reload_encoder_z_dim if reload_use_encoder else 0  # z_dim for the policy, 0 if no encoder is used
+    reload_policy_z_dim = 0
+    if reload_use_encoder == "slope":
+        reload_policy_z_dim = 3
+    elif reload_use_encoder == "gru":
+        reload_policy_z_dim = reload_encoder_z_dim
     if reload_policy_type == "stochastic_gru":
         reload_policy = StochasticRNNPolicyStepwise(obs_dim, act_dim, z_dim=reload_policy_z_dim, hidden_dim=reload_policy_hidden_dim).to(device)  # With dynamics encoding
     elif reload_policy_type == "stochastic_mlp":
-        reload_policy = StochasticMLPPolicy(obs_dim, act_dim, seq_len=seq_window_len, z_dim=reload_policy_z_dim).to(device)
+        reload_policy = StochasticMLPPolicy(obs_dim-1, act_dim, seq_len=seq_window_len, z_dim=reload_policy_z_dim).to(device)
     else:
         raise ValueError(f"Unsupported policy type: {reload_policy_type}")
     reload_policy.load_state_dict(torch.load(policy_path))
