@@ -2,6 +2,7 @@ from matplotlib.pylab import mean
 import torch
 import torch.nn as nn
 import torch.distributions as D
+import torch.nn.functional as F
 
 
 def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic_mlp", export_path="mlp_policy.onnx", step_wise=False):
@@ -27,21 +28,24 @@ def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic_mlp"
         #         }
         #     )
         # else:
-        dummy_input = torch.randn(1, seq_len, obs_dim)  # 3D input: (batch_size, seq_len, obs_dim) to match the expected input shape in cpp
+        dummy_input = torch.randn(1, seq_len, obs_dim-1)  # 3D input: (batch_size, seq_len, obs_dim) to match the expected input shape in cpp
+        dummy_terminal = torch.zeros(1, 1, 1)  # (B, 1, 1) terminal flag
         dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
 
-        dummy_input, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
+        dummy_input, dummy_terminal, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_terminal.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
 
         torch.onnx.export(
             policy, 
-            (dummy_input, dummy_z_dyn),  # Tuple of inputs
+            (dummy_input, dummy_terminal, dummy_z_dyn),  # Tuple of inputs
             export_path,
             export_params=True,
             opset_version=11,
-            input_names=["input", "z_dyn"],
+            input_names=["input", "terminal", "z_dyn"],
             output_names=["output"],
             dynamic_axes={
                 "input": {0: "batch_size"},  # support variable batch size
+                "terminal": {0: "batch_size"},  # support variable batch size
+                "z_dyn": {0: "batch_size"},  # support variable batch size
                 "output": {0: "batch_size"}
             }
         )
@@ -139,12 +143,13 @@ class MLPSeqPolicy(nn.Module):
             raise ValueError(f"Unsupported obs_seq shape: {obs_seq.shape}")
     
 class StochasticMLPPolicy(nn.Module):
-    def __init__(self, obs_dim, act_dim, seq_len, z_dim=32, hidden_dims=(128, 128)):
+    def __init__(self, obs_dim=6, act_dim=2, seq_len=1, z_dim=32, hidden_dims=(128, 128)):
         super().__init__()
         self.obs_dim = obs_dim
         self.z_dim = z_dim
+        self.terminal_dim = 1  # terminal flag dimension
         self.seq_len = seq_len
-        input_dim = obs_dim*self.seq_len + z_dim  # Combined input
+        input_dim = obs_dim*self.seq_len + self.terminal_dim + z_dim  # Combined input
         
         layers = []
         dims = [input_dim] + list(hidden_dims)
@@ -154,10 +159,14 @@ class StochasticMLPPolicy(nn.Module):
 
         self.mean_head = nn.Linear(dims[-1], act_dim)
         self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+        self.clamp_min = 0
+        self.clamp_max = 30
         
-    def _pack(self, obs, z_dyn):
+    def _pack(self, obs, if_terminal, z_dyn):
         """
         obs: (B, T, obs_dim)
+        terminal: (B, 1*1) 
         z_dyn: (B, 1, z_dim) or None
         returns flattened input (B, seq_len*obs_dim [+ z_dim])
         """
@@ -168,6 +177,7 @@ class StochasticMLPPolicy(nn.Module):
             raise ValueError(f"Input sequence length {T} does not match expected seq_len {self.seq_len}.")
 
         x = obs.reshape(obs.size(0), -1)          # (B, T*D)
+        x = torch.cat([x, if_terminal], dim=-1)  # (B, T*D + 1)
 
         if z_dyn is None: # z_dyn is only None when z_dim = 0
             x = x
@@ -176,18 +186,29 @@ class StochasticMLPPolicy(nn.Module):
             x = torch.cat([x, z_dyn], dim=-1)
         return x
 
-    def forward(self, obs, z_dyn=None):
-        # obs: (B, T, obs_dim),
+    def forward(self, obs, terminal, z_dyn=None):
+        # obs: (B, T, obs_dim)
+        # terminal: (B, 1, 1)
         # z_dyn: (B, 1, z_dim)
-        x = self._pack(obs, z_dyn)
+        B = obs.size(0)
+        if_terminal = terminal.view(B, 1).float()             # (B, 1)
+
+        x = self._pack(obs, if_terminal, z_dyn)
         latent = self.encoder(x)
         mean = self.mean_head(latent)
+
+        # force monotonicity
+        mean = F.softplus(mean)
+        mean = torch.clamp(mean, min=0.0, max=1.0)  # normalized action is in [0, 1]
+
+        # Hard gate: set to zero after terminal (per your demos)
+        mean = (1.0 - if_terminal) * mean
+
         return mean
 
-    def get_dist(self, obs, z_dyn=None):
-        x = self._pack(obs, z_dyn)
-        latent = self.encoder(x)
-        mean = self.mean_head(latent)
+    def get_dist(self, obs, terminal, z_dyn=None):
+        mean = self.forward(obs, terminal, z_dyn)
+
         log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)  # σ in [~0.007, ~7.4]
         std = torch.exp(log_std).expand_as(mean)
         return torch.distributions.Normal(mean, std)
