@@ -3,11 +3,13 @@ import torch
 import torch.nn as nn
 import torch.distributions as D
 import torch.nn.functional as F
+from torch.distributions import Normal, TransformedDistribution
+from torch.distributions.transforms import SigmoidTransform
 
 
 def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic_mlp", export_path="mlp_policy.onnx", step_wise=False):
     policy.eval()
-    if policy_type == "stochastic_mlp":
+    if policy_type == "stochastic_mlp" or policy_type == "stochastic_two_head_mlp" or policy_type == "stochastic_two_head_transform_mlp" or policy_type == "stochastic_two_head_film_mlp":
         # if seq_len is not None and seq_len > 1:
         #     dummy_input = torch.randn(1, 1, seq_len, obs_dim)
         #     dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
@@ -98,6 +100,79 @@ def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic_mlp"
             )
     print(f"ONNX model exported to {export_path}")
 
+# class CensoredSquashedNormal:
+#     """
+#     Distribution-like wrapper that:
+#       - pre-terminal: y = sigmoid(x),  x ~ Normal(mean_pre, std)
+#       - post-terminal: left-censored at y <= eps_censor, because sigmoid(x) is bounded in (0, 1) and excludes 0 and 1
+#     Provides log_prob(y) and entropy() shaped like (B, act_dim).
+#     """
+#     def __init__(self, mean_pre, std, terminal, eps_censor=1e-4, eps_obs=1e-6):
+#         """
+#         mean_pre : (B, A)   pre-sigmoid mean
+#         std      : (B, A)   std for latent Normal
+#         terminal : (B, 1) or (B, 1, 1) with {0,1}
+#         """
+#         self.mean_pre = mean_pre
+#         self.std = std
+#         self.base = Normal(loc=mean_pre, scale=std)
+#         self.squashed = TransformedDistribution(self.base, [SigmoidTransform()])
+#         # Masks broadcast to action dims
+#         if terminal.dim() == 3:
+#             terminal = terminal.squeeze(-1)  # (B,1)
+#         self.pre_mask  = (terminal == 0).float()            # (B,1)
+#         self.post_mask = 1.0 - self.pre_mask                # (B,1)
+#         self.eps_censor = eps_censor
+#         self.eps_obs = eps_obs
+
+#     def _expand_mask(self, y):
+#         # Expand (B,1) -> (B, A)
+#         return self.pre_mask.expand_as(y), self.post_mask.expand_as(y)
+
+#     def log_prob(self, y):
+#         """
+#         Returns per-dimension log-prob, shape (B, A).
+#         Pre-terminal: usual logistic-normal log_prob.
+#         Post-terminal: log P(Y <= eps_censor) via latent Normal CDF (left-censored), to compensate for 0 that is excluded in sigmoid.
+#         """
+#         # Clip observations very slightly to avoid logit/0 issues
+#         y_clip = y.clamp(self.eps_obs, 1.0 - self.eps_obs)
+
+#         pre_m, post_m = self._expand_mask(y_clip)
+
+#         # A) pre-terminal: standard squashed Gaussian likelihood
+#         lp_pre = self.squashed.log_prob(y_clip)
+
+#         # B) post-terminal: left-censored at eps_censor  (doesn't depend on y)
+#         x_thr = torch.logit(torch.full_like(y_clip, self.eps_censor))
+#         z = (x_thr - self.mean_pre) / self.std
+#         std_norm = Normal(torch.zeros_like(z), torch.ones_like(z))
+#         # clamp CDF to avoid log(0)
+#         lp_post = torch.log(torch.clamp(std_norm.cdf(z), min=1e-12))
+
+#         return pre_m * lp_pre + post_m * lp_post
+
+#     def entropy(self):
+#         """
+#         Use latent Normal entropy for pre-terminal; zero post-terminal.
+#         Returns (B, A).
+#         """
+#         ent_latent = self.base.entropy()  # (B, A)
+#         pre_m, post_m = self._expand_mask(ent_latent)
+#         return pre_m * ent_latent + post_m * 0.0
+
+#     # Optional convenience for sampling at runtime
+#     def rsample(self):
+#         x = self.base.rsample()
+#         y = torch.sigmoid(x)
+#         # Hard gate to zero after terminal for execution-time safety
+#         return y * self.pre_mask  # pre_mask==1 where terminal==0
+
+#     def sample(self):
+#         with torch.no_grad():
+#             return self.rsample()
+
+
 class MLPPolicy(nn.Module):
     def __init__(self, obs_dim: int, act_dim: int, hidden_dims=(128, 128)):
         super().__init__()
@@ -161,7 +236,7 @@ class StochasticMLPPolicy(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(act_dim))
 
         self.clamp_min = 0
-        self.clamp_max = 30
+        self.clamp_max = 1
         
     def _pack(self, obs, if_terminal, z_dyn):
         """
@@ -186,28 +261,45 @@ class StochasticMLPPolicy(nn.Module):
             x = torch.cat([x, z_dyn], dim=-1)
         return x
 
-    def forward(self, obs, terminal, z_dyn=None):
+    def forward(self, obs, terminal, z_dyn=None, return_pre_squash=False):
         # obs: (B, T, obs_dim)
         # terminal: (B, 1, 1)
         # z_dyn: (B, 1, z_dim)
         B = obs.size(0)
-        if_terminal = terminal.view(B, 1).float()             # (B, 1)
+        if_terminal = (terminal.view(B, -1) > 0.5).float()            # (B, 1)
 
         x = self._pack(obs, if_terminal, z_dyn)
         latent = self.encoder(x)
-        mean = self.mean_head(latent)
+        pre_mean = self.mean_head(latent)
+
+        if return_pre_squash:
+            return pre_mean
 
         # force monotonicity
-        mean = F.softplus(mean)
-        mean = torch.clamp(mean, min=0.0, max=1.0)  # normalized action is in [0, 1]
+        # mean = F.softplus(mean)
+        # mean = torch.clamp(mean, min=self.clamp_min, max=self.clamp_max)  # normalized action is in [0, 1]
+        mean = torch.sigmoid(pre_mean)  # normalized action is in [0, 1]
 
         # Hard gate: set to zero after terminal (per your demos)
         mean = (1.0 - if_terminal) * mean
 
         return mean
 
+    # def get_dist(self, obs, terminal, z_dyn=None, eps_censor=1e-4, eps_obs=1e-6):
+    #     # obs: (B, T, obs_dim)
+    #     # terminal: (B, 1, 1)
+    #     # z_dyn: (B, 1, z_dim)
+    #     mean_pre = self.forward(obs, terminal, z_dyn, return_pre_squash=False)
+
+    #     log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)  # σ in [~0.007, ~7.4]
+    #     std = torch.exp(log_std).expand_as(mean_pre)
+
+    #     # base = torch.distributions.Normal(loc=mean_pre, scale=std)
+    #     # dist = torch.distributions.TransformedDistribution(base, [torch.distributions.transforms.SigmoidTransform()])  # support (0,1)
+    #     return CensoredSquashedNormal(mean_pre, std, terminal, eps_censor=eps_censor, eps_obs=eps_obs)
+
     def get_dist(self, obs, terminal, z_dyn=None):
-        mean = self.forward(obs, terminal, z_dyn)
+        mean = self.forward(obs, terminal, z_dyn, return_pre_squash=False) # TODO@KejiaChen try later with true
 
         log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)  # σ in [~0.007, ~7.4]
         std = torch.exp(log_std).expand_as(mean)
@@ -215,6 +307,293 @@ class StochasticMLPPolicy(nn.Module):
     
     def get_z_dim(self):
         return self.z_dim
+
+class StochasticTwoHeadMLPPolicy(nn.Module):
+    def __init__(self, obs_dim=6, act_dim=2, seq_len=1, z_dim=32, obs_hidden_dims=(128, 128), z_hidden_dims=(32, 32)):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.z_dim = z_dim
+        self.terminal_dim = 1  # terminal flag dimension
+        self.seq_len = seq_len
+        self.alpha_lo, self.alpha_hi = [0.7, 1.4]
+        self.beta_max = 0.1
+
+        # ---- Obs encoder (separate head) ----
+        obs_input_dim = obs_dim * seq_len        
+        obs_layers = []
+        obs_head_dims = [obs_input_dim] + list(obs_hidden_dims)
+        for in_dim, out_dim in zip(obs_head_dims[:-1], obs_head_dims[1:]):
+            obs_layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
+        self.obs_head = nn.Sequential(*obs_layers)
+
+        # ---- z_dyn head (separate) ----
+        z_head_dims = [z_dim] + list(z_hidden_dims)
+        z_mlp = []
+        for in_dim, out_dim in zip(z_head_dims[:-1], z_head_dims[1:]):
+            z_mlp += [nn.Linear(in_dim, out_dim), nn.ReLU()]
+        self.z_head = nn.Sequential(*z_mlp)
+
+        # ---- fuse obs and terminal and z_dyn ----
+        self.fuse_hidden_dim = 128
+        self.base_fuse = nn.Sequential(
+            nn.Linear(obs_hidden_dims[1] + 1 + z_hidden_dims[1], self.fuse_hidden_dim), nn.ReLU(),
+            nn.Linear(self.fuse_hidden_dim, act_dim)
+        )
+
+        # log std
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+        self.clamp_min = 0
+        self.clamp_max = 1
+
+    def forward(self, obs, terminal, z_dyn=None, return_pre_squash=False):
+        # obs: (B, T, obs_dim)
+        # terminal: (B, 1, 1)
+        # z_dyn: (B, 1, z_dim)
+        B = obs.size(0)
+        terminal = terminal.view(B, -1)  # (B, 1)
+        z_dyn = z_dyn.view(B, -1) if z_dyn is not None else None  # (B, z_dim)
+        if_terminal = (terminal > 0.5).float()            # (B, 1)
+
+        x = obs.reshape(obs.size(0), -1)  # (B, T*obs_dim)
+        h_obs = self.obs_head(x)              # (B, hidden[1])
+        h_z = self.z_head(z_dyn)              # (B, 64)
+
+        h_fuse = torch.cat([h_obs, terminal.float(), h_z], dim=-1)  # (B, 128+1+64)
+        y_pre = self.base_fuse(h_fuse)
+
+        if return_pre_squash:
+            return y_pre
+
+        # y = torch.sigmoid(y_pre)  # sigmoid seems to be a bad choice here because of easy saturation
+        y = torch.clamp(y_pre, min=self.clamp_min, max=self.clamp_max)  # normalized action is in [0, 1]
+        mean = y * (1.0 - terminal.float())  # broadcast over act_dim
+
+        return mean
+
+    def get_dist(self, obs, terminal, z_dyn=None):
+        mean = self.forward(obs, terminal, z_dyn, return_pre_squash=True)
+
+        log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)  # σ in [~0.007, ~7.4]
+        std = torch.exp(log_std).expand_as(mean)
+        return torch.distributions.Normal(mean, std)
+    
+    def get_z_dim(self):
+        return self.z_dim
+
+class StochasticTwoHeadTransformMLPPolicy(nn.Module):
+    def __init__(self, obs_dim=6, act_dim=2, seq_len=1, z_dim=32, obs_hidden_dims=(128, 128), z_hidden_dims=(32, 32)):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.z_dim = z_dim
+        self.terminal_dim = 1  # terminal flag dimension
+        self.seq_len = seq_len
+        self.alpha_lo, self.alpha_hi = [0.7, 1.4]
+        self.beta_max = 0.1
+
+        # ---- Obs encoder (separate head) ----
+        obs_input_dim = obs_dim * seq_len        
+        obs_layers = []
+        obs_head_dims = [obs_input_dim] + list(obs_hidden_dims)
+        for in_dim, out_dim in zip(obs_head_dims[:-1], obs_head_dims[1:]):
+            obs_layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
+        self.obs_head = nn.Sequential(*obs_layers)
+
+        # ---- z_dyn head (separate) ----
+        z_head_dims = [z_dim] + list(z_hidden_dims)
+        z_mlp = []
+        for in_dim, out_dim in zip(z_head_dims[:-1], z_head_dims[1:]):
+            z_mlp += [nn.Linear(in_dim, out_dim), nn.ReLU()]
+        self.z_head = nn.Sequential(*z_mlp)
+
+        # ---- fuse obs and terminal ----
+        self.fuse_hidden_dim = 96
+        self.base_fuse = nn.Sequential(
+            nn.Linear(obs_hidden_dims[1] + 1, self.fuse_hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(self.fuse_hidden_dim, act_dim)
+        )
+
+        # ---Time-varying adaptation from current base features
+        self.adapt_hidden_dim = 32
+        self.adapt = nn.Sequential(
+            nn.Linear(self.fuse_hidden_dim + z_hidden_dims[1], self.adapt_hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(self.adapt_hidden_dim, 2 * act_dim)  # split into [alpha_raw, beta_raw]
+        )
+
+        # log std
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+        self.clamp_min = 0
+        self.clamp_max = 1
+
+    def forward(self, obs, terminal, z_dyn=None, return_pre_squash=False):
+        # obs: (B, T, obs_dim)
+        # terminal: (B, 1, 1)
+        # z_dyn: (B, 1, z_dim)
+        B = obs.size(0)
+        terminal = terminal.view(B, -1)  # (B, 1)
+        z_dyn = z_dyn.view(B, -1) if z_dyn is not None else None  # (B, z_dim)
+        if_terminal = (terminal > 0.5).float()            # (B, 1)
+
+        x = obs.reshape(obs.size(0), -1)  # (B, T*obs_dim)
+        h_obs = self.obs_head(x)              # (B, hidden[1])
+        h_z = self.z_head(z_dyn)              # (B, 64)
+
+        # Fuse terminal directly (scalar) into base path
+        h_base_in = torch.cat([h_obs, terminal.float()], dim=-1)  # (B, hidden[1]+1)
+        h_base = self.base_fuse[0](h_base_in)                    # Linear
+        h_base = F.relu(h_base)                                   # ReLU
+        base_logits = self.base_fuse[2](h_base)                  # Linear -> (B, act_dim)
+        # base = F.softplus(base_logits)                            # ≥ 0
+
+        # Time-varying adaptation α_t, β_t from current features + z
+        h_adapt_in = torch.cat([h_base, h_z], dim=-1)             # (B, 128+64)
+        ab = self.adapt(h_adapt_in)                               # (B, 2*act_dim)
+        a_raw, b_raw = torch.chunk(ab, 2, dim=-1)
+
+        # Bound α and β for stability
+        alpha = self.alpha_lo + (self.alpha_hi - self.alpha_lo) * torch.sigmoid(a_raw)  # (B, act_dim)
+        beta  = self.beta_max * torch.tanh(b_raw)                                       # (B, act_dim)
+
+        # print(f"alpha: {alpha}, beta: {beta}")
+
+        # Combine, clamp to [0,1], then hard gate by terminal
+        y_pre = alpha * base_logits + beta
+        if return_pre_squash:
+            return y_pre
+        # y = torch.sigmoid(y_pre)  
+        y = torch.clamp(y_pre, min=self.clamp_min, max=self.clamp_max)  # normalized action is in [0, 1]
+        mean = y * (1.0 - terminal.float())  # broadcast over act_dim
+
+        return mean
+
+    def get_dist(self, obs, terminal, z_dyn=None):
+        mean = self.forward(obs, terminal, z_dyn, return_pre_squash=True)
+
+        log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)  # σ in [~0.007, ~7.4]
+        std = torch.exp(log_std).expand_as(mean)
+        return torch.distributions.Normal(mean, std)
+    
+    def get_z_dim(self):
+        return self.z_dim
+    
+class StochasticTwoHeadFiLMMLPPolicy(nn.Module):
+    def __init__(self,
+                 obs_dim=6,
+                 act_dim=2,
+                 seq_len=1,
+                 z_dim=32,
+                 obs_hidden_dims=(128, 128),
+                 z_hidden_dims=(32, 32),
+                 fuse_hidden_dim=128,
+                 gamma_scale=0.5,   # bounds FiLM scale; 0.5 → (1 ± 0.5)
+                 beta_scale=0.2     # bounds FiLM shift
+                 ):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.z_dim = z_dim
+        self.seq_len = seq_len
+
+        self.fuse_hidden_dim = fuse_hidden_dim
+        self.gamma_scale = gamma_scale
+        self.beta_scale = beta_scale
+
+        # ---- Obs encoder ----
+        obs_input_dim = obs_dim * seq_len
+        obs_layers = []
+        obs_head_dims = [obs_input_dim] + list(obs_hidden_dims)
+        for in_dim, out_dim in zip(obs_head_dims[:-1], obs_head_dims[1:]):
+            obs_layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
+        self.obs_head = nn.Sequential(*obs_layers)
+
+        # ---- z_dyn head ----
+        z_head_dims = [z_dim] + list(z_hidden_dims)
+        z_layers = []
+        for in_dim, out_dim in zip(z_head_dims[:-1], z_head_dims[1:]):
+            z_layers += [nn.Linear(in_dim, out_dim), nn.ReLU()]
+        self.z_head = nn.Sequential(*z_layers)
+        self.z_out_dim = z_hidden_dims[-1]
+
+        # ---- Base trunk: obs+terminal → features (no z here) ----
+        self.base_trunk = nn.Sequential(
+            nn.Linear(obs_hidden_dims[-1] + 1, fuse_hidden_dim),
+            nn.ReLU(),
+        )
+
+        # ---- FiLM generator from z: produces per-feature (gamma, beta) ----
+        self.film = nn.Linear(self.z_out_dim, 2 * fuse_hidden_dim)
+
+        # ---- Final action head: modulated features → y_pre (unbounded) ----
+        self.action_head = nn.Linear(fuse_hidden_dim, act_dim)
+
+        # ---- Stochasticity (latent Normal over y_pre) ----
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+        # Inference clamp (if you choose to clamp at runtime)
+        self.clamp_min = 0.0
+        self.clamp_max = 1.0
+
+        # (Optional) mild init to avoid early saturation
+        nn.init.uniform_(self.action_head.weight, -0.02, 0.02)
+        nn.init.constant_(self.action_head.bias, 0.0)
+
+    def forward(self, obs, terminal, z_dyn=None, return_pre_squash=False):
+        """
+        obs:      (B, T, obs_dim)
+        terminal: (B, 1, 1) or (B, 1)
+        z_dyn:    (B, 1, z_dim) or (B, z_dim)
+        """
+        B = obs.size(0)
+        terminal = terminal.view(B, -1).float()  # (B,1)
+
+        # Encoders
+        x = obs.reshape(B, -1)                   # (B, T*obs_dim)
+        h_obs = self.obs_head(x)                 # (B, obs_hidden_dims[-1])
+
+        if z_dyn is not None:
+            z = z_dyn.view(B, -1)
+            h_z = self.z_head(z)                 # (B, z_out_dim)
+        else:
+            h_z = torch.zeros(B, self.z_out_dim, device=obs.device, dtype=obs.dtype)
+
+        # Base features from obs + terminal
+        h_base_in = torch.cat([h_obs, terminal], dim=-1)          # (B, obs_hidden+1)
+        h_base = self.base_trunk(h_base_in)                        # (B, H)
+
+        # FiLM from z: per-feature scale & shift
+        gb = self.film(h_z)                                        # (B, 2H)
+        gamma, beta = torch.chunk(gb, 2, dim=-1)                   # (B, H) each
+        # Bound the modulation for stability
+        gamma = self.gamma_scale * torch.tanh(gamma)               # in (-γs, γs)
+        beta  = self.beta_scale  * torch.tanh(beta)                # in (-βs, βs)
+
+        # Modulate features, then linear to y_pre (unbounded)
+        h_tilde = (1.0 + gamma) * h_base + beta                    # (B, H)
+        y_pre = self.action_head(h_tilde)                          # (B, act_dim)
+
+        if return_pre_squash:
+            return y_pre
+
+        # Inference: map to [0,1] only here (training should use y_pre)
+        y = torch.clamp(y_pre, min=self.clamp_min, max=self.clamp_max)
+        mean = y * (1.0 - terminal)                                # hard gate after terminal
+        return mean
+
+    def get_dist(self, obs, terminal, z_dyn=None):
+        """
+        Returns an unbounded Normal over the pre-squash output y_pre.
+        Train your NLL in this latent space; clamp/sigmoid only for runtime actions.
+        """
+        mean_pre = self.forward(obs, terminal, z_dyn, return_pre_squash=True)
+        log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)    # keep your empirically good floor
+        std = torch.exp(log_std).expand_as(mean_pre)
+        return torch.distributions.Normal(mean_pre, std)
+
+    def get_z_dim(self):
+        return self.z_dim
+
 
 class StochasticMLPSeqPolicy(nn.Module):
     def __init__(self, obs_dim, act_dim, seq_len: int, hidden_dims=(128, 128)):
