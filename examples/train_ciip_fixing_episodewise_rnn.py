@@ -10,7 +10,7 @@ from torch.nn.utils.rnn import pad_sequence
 import torch.optim as optim
 import torch.nn.functional as F
 from policies import *
-from dynamics_encoder_decoder import DynamicsRNNEncoder, masked_mse, export_dynamic_encoder_to_onnx
+from dynamics_encoder_decoder import *
 from return_functions import *
 
 from build_episode_dataset import load_trajectories, normalize_obs, unnormalize_obs, normalize_acts, unnormalize_acts
@@ -70,7 +70,7 @@ def slope_z_wrapper(labels):
     z = z/max_contact_slope
     return z
     # return torch.ones_like(z)
-    
+
 def collate_variable_episodes(batch, include_terminal=False):
     """
     Args:
@@ -122,7 +122,8 @@ def collate_variable_episodes(batch, include_terminal=False):
     original_mask = time < original_lengths.unsqueeze(1) # (B, T_max)
     fitting_mask = time < fixing_lengths.unsqueeze(1)  # (B, T_max)
     # policy_mask = torch.ones(obs_padded.shape[0], obs_padded.shape[1], dtype=torch.bool)
-    policy_mask = original_mask.clone()  # (B, T_max)
+    # policy_mask = original_mask.clone()  # (B, T_max)
+    policy_mask = fitting_mask.clone()  # (B, T_max)
     encoder_mask = fitting_mask.clone()
     # policy_mask = torch.ones(obs_padded.shape[0], obs_padded.shape[1], dtype=torch.bool)
     # policy_mask = torch.arange(obs_padded.size(1)).unsqueeze(0) < lengths.unsqueeze(1)  # (B, T_max)
@@ -136,6 +137,23 @@ def collate_variable_episodes(batch, include_terminal=False):
 
     return obs_padded, act_padded, torch.tensor(weights), policy_mask, encoder_mask, original_lengths, fixing_lengths, labels
 
+def masked_update(prev, new, mask, batch_dim=0):
+    """
+    prev/new: tensors or tuples of tensors with leading batch dim B
+    mask: (B,) boolean tensor (True = update, False = keep prev)
+    batch_dim: dimension of batch (0 for z_dyn, 1 for encoder_h)
+    """
+    # Basic checks
+    if prev.shape != new.shape:
+        raise ValueError(f"Shape mismatch: {prev.shape} vs {new.shape}")
+    
+    # Broadcast mask to prev's shape
+    B = mask.shape[0]
+
+    desired_shape = [1] * prev.dim()
+    desired_shape[batch_dim] = B
+    m = mask.view(*desired_shape).to(prev.device)
+    return torch.where(m, new, prev)
 
 def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, policy_window_length, encoder_window_length, 
                                              policy_mask, encoder_mask, policy, encoder, labels,
@@ -153,35 +171,57 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
 
     if policy_type == "stochastic_gru":
         policy_h = policy.init_hidden(batch_size=B, device=obs_padded.device)  # Initialize hidden state
-    if use_encoder == "gru":
+    if use_encoder == "gru_dynamics" or use_encoder == "gru_sysid":
         encoder_h = encoder.init_hidden(batch_size=B, device=obs_padded.device)  # Initialize encoder hidden state
     log_prob_seq = []
     pred_seq = []
     entropy_seq = []
 
+    z_last = None
     if use_encoder == "slope": # slope z should be static for the whole episode
         z_dyn = slope_z_wrapper(labels)
         z_dyn = z_dyn.unsqueeze(1)  # (B, 1, z_dim)
         # z_dyn = z_dummy
-
+    
     for t in range(T):
         # 1. One-step observation
         obs_step = obs_padded[:, t, :]  # (B, 1, obs_dim)
         act_step = act_padded[:, t, :]  # (B, 1, act_dim)
+        act_prev = act_padded[:, t-1, :] if t > 0 else torch.zeros_like(act_step)  # (B, act_dim)
+        encoder_active_t = encoder_mask[:, t].bool()
 
         # 2. Encoder windowed input
-        if use_encoder == "gru":
+        if use_encoder == "gru_dynamics":
             if encoder_window_length >= 1:
                 windowed_input = get_obs_padded_window(obs_padded, t, encoder_window_length, window_obs_dim=obs_dim-1)  # (B, window_len, obs_dim-1)
-                z_dyn, encoder_h = encoder(windowed_input, encoder_h)
+                z_dyn_new, encoder_h_new = encoder(windowed_input, encoder_h)
+
+                if z_last is None:
+                    z_last = torch.zeros_like(z_dyn_new)  # Initialize z_last if not set
+                
+                # update z_dyn if it's still not terminal, otherwise use last value
+                z_dyn = masked_update(z_last.detach(), z_dyn_new, encoder_active_t, batch_dim=0)
+                encoder_h = masked_update(encoder_h.detach(), encoder_h_new, encoder_active_t, batch_dim=1)
+                # keep the last z_dyn for next step
+                z_last = z_dyn 
             # else:
             #     single_input = obs_step[:, :-1].unsqueeze(1)  # (B, 1, obs_dim-1)
             #     z_dyn, encoder_h = encoder(single_input, encoder_h)
-            if t >= terminal_index[0].item():
-                z_dyn = torch.zeros_like(z_dyn)
-            
             # TODO: temp solution
             # z_dyn = z_dyn.squeeze(1)
+        elif use_encoder == "gru_sysid":
+            input_t = torch.cat([obs_step[:, :-1], act_prev], dim=-1)  # (B, obs_dim-1 + act_dim)
+            input_t = input_t.unsqueeze(1)  # (B, 1, obs_dim + act_dim)
+            z_dyn_new, encoder_h_new = encoder(input_t, encoder_h)
+
+            if z_last is None:
+                    z_last = torch.zeros_like(z_dyn_new)  # Initialize z_last if not set
+                
+            # update z_dyn if it's still not terminal, otherwise use last value
+            z_dyn = masked_update(z_last.detach(), z_dyn_new, encoder_active_t, batch_dim=0)
+            encoder_h = masked_update(encoder_h.detach(), encoder_h_new, encoder_active_t, batch_dim=1)
+            # keep the last z_dyn for next step
+            z_last = z_dyn 
         elif use_encoder == "null": # null
             z_dyn = None
             encoder_h = None
@@ -294,7 +334,11 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_wind
                     encoder_path = os.path.join(log_dir, f"encoder_epoch_{epoch}.pth")
                     torch.save(encoder.state_dict(), encoder_path)
                     # encoder.set_export(True)  # Enable ONNX export
-                    export_dynamic_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, f"trained_BC_encoder_{epoch}.onnx"))   
+                    if use_encoder == "gru_dynamics":
+                        encoder_input_dim = obs_dim - 1
+                    elif use_encoder == "gru_sysid":
+                        encoder_input_dim = obs_dim + act_dim - 1
+                    export_encoder_to_onnx(encoder, input_dim=encoder_input_dim, export_path=os.path.join(log_dir, f"trained_BC_encoder_{epoch}.onnx"))
                     print(f"Saved encoder at {encoder_path}")
                     # encoder.set_export(False)  # Disable ONNX export after saving
 
@@ -360,17 +404,17 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
             fixing_lengths = fixing_lengths.to(device)           # (1,)
             labels = labels.to(device)             # (1,)
 
-            new_labels1 = torch.tensor([11]).to(device)
+            # new_labels1 = torch.tensor([11]).to(device)
             pred, masked_weighted_loss, masked_weight = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_length, encoder_window_length,
-                                                                                                policy_mask, encoder_mask, policy, encoder, new_labels1, policy_type, use_encoder, train=False,
+                                                                                                policy_mask, encoder_mask, policy, encoder, labels, policy_type, use_encoder, train=False,
                                                                                                 z_dummy=torch.zeros((obs_batch.size(0), 1, 5), device=device))  # z_dummy for slope encoder
             total_loss += masked_weighted_loss.item()
             total_weight += masked_weight
 
-            new_labels2 = torch.tensor([2]).to(device)  # Dummy label for testing the second prediction
-            pred2, masked_weighted_loss2, masked_weight2 = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_length, encoder_window_length,
-                                                                                                policy_mask, encoder_mask, policy, encoder, new_labels2, policy_type, use_encoder, train=False,
-                                                                                                z_dummy=torch.ones((obs_batch.size(0), 1, 5), device=device))  # z_dummy for slope encoder
+            # new_labels2 = torch.tensor([2]).to(device)  # Dummy label for testing the second prediction
+            # pred2, masked_weighted_loss2, masked_weight2 = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_length, encoder_window_length,
+            #                                                                                     policy_mask, encoder_mask, policy, encoder, new_labels2, policy_type, use_encoder, train=False,
+            #                                                                                     z_dummy=torch.ones((obs_batch.size(0), 1, 5), device=device))  # z_dummy for slope encoder
             # total_loss2 += masked_weighted_loss2.item()
             # total_weight2 += masked_weight2
 
@@ -380,21 +424,21 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
                     unnormalized_obs_ep = unnormalize_obs(obs_batch[b, :, :])
                     unnormalized_act_ep = unnormalize_acts(act_batch[b, :, :])
                     unnormalize_prediction = unnormalize_acts(pred[b, :, :])
-                    unnormalize_prediction2 = unnormalize_acts(pred2[b, :, :])
+                    # unnormalize_prediction2 = unnormalize_acts(pred2[b, :, :])
 
                     T = unnormalized_obs_ep.size(0)
                     fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
                     axs[0].plot(range(T), unnormalized_obs_ep[:, 0].cpu().numpy(), label="Observation", color="green")
                     axs[0].plot(range(T), unnormalized_act_ep[:, 0].cpu().numpy(), label="Ground Truth Action", color="red")
                     axs[0].plot(range(T), unnormalize_prediction[:, 0].cpu().numpy(), label="Predicted Action", color="blue", linestyle="--")
-                    axs[0].plot(range(T), unnormalize_prediction2[:, 0].cpu().numpy(), label="Predicted Action (z=1)", color="orange", linestyle="--")
+                    # axs[0].plot(range(T), unnormalize_prediction2[:, 0].cpu().numpy(), label="Predicted Action (z=1)", color="orange", linestyle="--")
                     axs[0].set_ylabel("Stretch")
                     axs[0].legend()
 
                     axs[1].plot(range(T), unnormalized_obs_ep[:, 3].cpu().numpy(), label="Observation", color="green")
                     axs[1].plot(range(T), unnormalized_act_ep[:, 1].cpu().numpy(), label="Ground Truth Action", color="red")
                     axs[1].plot(range(T), unnormalize_prediction[:, 1].cpu().numpy(), label="Predicted Action", color="blue", linestyle="--")
-                    axs[1].plot(range(T), unnormalize_prediction2[:, 1].cpu().numpy(), label="Predicted Action (z=1)", color="orange", linestyle="--")
+                    # axs[1].plot(range(T), unnormalize_prediction2[:, 1].cpu().numpy(), label="Predicted Action (z=1)", color="orange", linestyle="--")
                     axs[1].set_ylabel("Push")
                     axs[1].legend()
 
@@ -420,30 +464,51 @@ def policy_wrapper(obs_dim, act_dim, seq_window_len, policy_type="stochastic_gru
         raise ValueError(f"Unknown policy type: {policy_type}")
     return policy
 
+def encoder_wrapper(obs_dim, act_dim, use_encoder="gru", pretrained_encoder=False, train_encoder=True, encoder_z_dim=5, encoder_hidden_dim=64):
+    if use_encoder == "null":
+        encoder = None
+    else:
+        if use_encoder == "gru_dynamics":
+            encoder = DynamicsRNNEncoder(input_dim=obs_dim-1, z_dim=encoder_z_dim, hidden_dim=encoder_hidden_dim).to(device)
+            if pretrained_encoder:
+                encoder_filename = "predict_f_x_v/best_encoder_2_encoding_True_input_False.pth"
+                encoder.load_state_dict(torch.load(f"d3rlpy_logs/Dynamics_Encoder/{encoder_filename}"))
+        elif use_encoder == "gru_sysid":
+            encoder = SysIdRNNEncoder(obs_dim=obs_dim-1, act_dim=act_dim, z_dim=encoder_z_dim).to(device)
+
+        if not train_encoder:
+            for param in encoder.parameters():
+                param.requires_grad = False
+
+    return encoder
+
 if __name__ == "__main__":
-    train = False # Set to False to skip training and only evaluate
+    train = True # Set to False to skip training and only evaluate
     reload_data= False # Set to True to reload the dataset from raw txt files, False to use the cached npz dataset stored from previous runs
     load_fixing_terminal_in_obs = True # Set to True to load the fixing terminal as an extra input dimension in the observation, False to ignore it
     update_step = 5  # update the policy output every 5 robot control loops, i.e. 200Hz for the 1000Hz robot control frequency
     policy_type = "stochastic_two_head_film_mlp"  # stochastic_gru or stochastic_mlp or stochastic_two_head_mlp or stochastic_two_head_transform_mlp or stochastic_two_head_film_mlp
-    use_encoder = "slope" # gru or slope or null
+    use_encoder = "gru_sysid" # null or slope or gru_dynamics or gru_sysid
+    pretrained_encoder = False  # if True, load the pretrained encoder from the specified path, if False, train a new encoder
     train_encoder = True
     if use_encoder == "null":
+        pretrained_encoder = False
         train_encoder = False  # if no encoder is used, no need to train it
+    if not pretrained_encoder:
+        train_encoder = True  # if not using a pretrained encoder, must train it 
     train_epochs = 200
     learning_rate = 1e-3
     batch_size = 8
-    seq_window_len = 30 #  30  # sequence length for the episode window dataset. Corresponding number of control loops: seq_window_len*update_step
+    seq_window_len = 1 #  30  # sequence length for the episode window dataset. Corresponding number of control loops: seq_window_len*update_step
     encoder_window_length = 0  # length of the sliding window for the encoder, -1 to use full input sequence
     encoder_hidden_dim = 64
     encoder_z_dim = 0
     if use_encoder == "slope":
         encoder_z_dim = 5
-    elif use_encoder == "gru":
+    elif use_encoder == "gru_dynamics" or use_encoder == "gru_sysid":
         encoder_z_dim = 16
     policy_z_dim = encoder_z_dim
     policy_hidden_dim = 128
-    encoder_filename = "predict_f_x_v/best_encoder_2_encoding_True_input_False.pth"
     
     '''---------------------------------------------prepare the dataset---------------------------------------'''
 
@@ -501,13 +566,7 @@ if __name__ == "__main__":
         collate_function = partial(collate_variable_episodes, include_terminal=load_fixing_terminal_in_obs)
         train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_function)
         
-        encoder = None
-        if use_encoder == "gru":
-            encoder = DynamicsRNNEncoder(input_dim=obs_dim-1, z_dim=encoder_z_dim, hidden_dim=encoder_hidden_dim).to(device)
-            encoder.load_state_dict(torch.load(f"d3rlpy_logs/Dynamics_Encoder/{encoder_filename}"))
-            if not train_encoder:
-                for param in encoder.parameters(): # freeze encoder parameters
-                    param.requires_grad = False
+        encoder = encoder_wrapper(obs_dim, act_dim, use_encoder=use_encoder, pretrained_encoder=pretrained_encoder, train_encoder=train_encoder, encoder_z_dim=encoder_z_dim, encoder_hidden_dim=encoder_hidden_dim)
 
         policy = policy_wrapper(obs_dim, act_dim, seq_window_len, policy_type=policy_type, policy_z_dim=policy_z_dim, policy_hidden_dim=policy_hidden_dim)
 
@@ -529,7 +588,7 @@ if __name__ == "__main__":
                             )
 
         policy_path = os.path.join(log_dir, "best_policy.pth")
-        encoder_path = os.path.join(log_dir, "encoder_epoch_30.pth")
+        encoder_path = os.path.join(log_dir, "best_encoder.pth")
 
         # save the policy
         torch.save(policy.state_dict(), policy_path)
@@ -538,16 +597,20 @@ if __name__ == "__main__":
         # save the encoder
         if encoder is not None:
             torch.save(encoder.state_dict(), encoder_path)
-            export_dynamic_encoder_to_onnx(encoder, export_path=os.path.join(log_dir, "dynamics_encoder.onnx"))
+            if use_encoder == "gru_dynamics":
+                encoder_input_dim = obs_dim - 1
+            elif use_encoder == "gru_sysid":
+                encoder_input_dim = obs_dim + act_dim - 1
+            export_encoder_to_onnx(encoder, input_dim=encoder_input_dim, export_path=os.path.join(log_dir, "trained_BC_encoder.onnx"))
 
     '''---------------------------------------------Evaluate the policy-------------------------------------'''
     # paths
     if not train:
-        log_stored_folder = "20250813_184704" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
+        log_stored_folder = "20250813_203125" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
         log_dir = os.path.join(log_base_dir, log_stored_folder)
     
     policy_path = os.path.join(log_dir, "best_policy.pth")
-    encoder_path = os.path.join(log_dir, "encoder_epoch_30.pth")
+    encoder_path = os.path.join(log_dir, "best_encoder.pth")
 
     import onnx
     # load and validat the inputs
@@ -575,12 +638,12 @@ if __name__ == "__main__":
     # print([i.name for i in encoder_onnx_model.graph.input])
     # print([i.name for i in encoder_onnx_model.graph.output])
 
-    encoder = None
+    reload_encoder = encoder_wrapper(obs_dim, act_dim, use_encoder=reload_use_encoder, pretrained_encoder=False, train_encoder=False, encoder_z_dim=reload_encoder_z_dim, encoder_hidden_dim=reload_encoder_hidden_dim)
+    if reload_use_encoder is not None:
+        reload_encoder.load_state_dict(torch.load(encoder_path))
+        reload_encoder.eval()  # Encoder is used for feature extraction only
+
     reload_policy_z_dim = reload_encoder_z_dim
-    if reload_use_encoder == "gru":
-        encoder = DynamicsRNNEncoder(input_dim=obs_dim-1, z_dim=reload_encoder_z_dim, hidden_dim=reload_encoder_hidden_dim).to(device)
-        encoder.load_state_dict(torch.load(f"d3rlpy_logs/Dynamics_Encoder/{encoder_filename}"))
-        encoder.eval()  # Encoder is used for feature extraction only    
     reload_policy = policy_wrapper(obs_dim, act_dim, seq_window_len, policy_type=reload_policy_type, policy_z_dim=reload_policy_z_dim, policy_hidden_dim=reload_policy_hidden_dim)
     reload_policy.load_state_dict(torch.load(policy_path))
     reload_policy.eval()    
@@ -589,7 +652,7 @@ if __name__ == "__main__":
 
     eval_avg_loss = evaluate_weighted_bc(
         reload_policy,
-        encoder,
+        reload_encoder,
         val_dataloader,
         policy_window_length=reload_seq_window_len,  # -1 to use full input sequence, otherwise use a sliding window of length policy_window_length
         encoder_window_length=encoder_window_length, # -1 to use full input sequence, otherwise use a sliding window of length encoder_window_length
