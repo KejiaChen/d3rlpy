@@ -32,21 +32,23 @@ def export_policy_to_onnx(policy, obs_dim, seq_len, policy_type="stochastic_mlp"
         # else:
         dummy_input = torch.randn(1, seq_len, obs_dim-1)  # 3D input: (batch_size, seq_len, obs_dim) to match the expected input shape in cpp
         dummy_terminal = torch.zeros(1, 1, 1)  # (B, 1, 1) terminal flag
+        dummy_insertion_sign = torch.ones(1, 1, 1)  # (B, 1, 1) insertion sign
         dummy_z_dyn = torch.randn(1, 1, policy.get_z_dim())  # (B, 1, z_dim)
 
-        dummy_input, dummy_terminal, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_terminal.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
+        dummy_input, dummy_terminal, dummy_insertion_sign, dummy_z_dyn = dummy_input.to(next(policy.parameters()).device), dummy_terminal.to(next(policy.parameters()).device), dummy_insertion_sign.to(next(policy.parameters()).device), dummy_z_dyn.to(next(policy.parameters()).device)
 
         torch.onnx.export(
-            policy, 
-            (dummy_input, dummy_terminal, dummy_z_dyn),  # Tuple of inputs
+            policy,
+            (dummy_input, dummy_terminal, dummy_insertion_sign, dummy_z_dyn),  # Tuple of inputs
             export_path,
             export_params=True,
             opset_version=11,
-            input_names=["input", "terminal", "z_dyn"],
+            input_names=["input", "terminal", "insertion_sign", "z_dyn"],
             output_names=["output"],
             dynamic_axes={
                 "input": {0: "batch_size"},  # support variable batch size
                 "terminal": {0: "batch_size"},  # support variable batch size
+                "insertion_sign": {0: "batch_size"},  # support variable batch size
                 "z_dyn": {0: "batch_size"},  # support variable batch size
                 "output": {0: "batch_size"}
             }
@@ -518,7 +520,7 @@ class StochasticTwoHeadFiLMMLPPolicy(nn.Module):
 
         # ---- Base trunk: obs+terminal → features (no z here) ----
         self.base_trunk = nn.Sequential(
-            nn.Linear(obs_hidden_dims[-1] + 1, fuse_hidden_dim),
+            nn.Linear(obs_hidden_dims[-1] + 2, fuse_hidden_dim),
             nn.ReLU(),
         )
 
@@ -532,14 +534,14 @@ class StochasticTwoHeadFiLMMLPPolicy(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(act_dim))
 
         # Inference clamp (if you choose to clamp at runtime)
-        self.clamp_min = 0.0
+        self.clamp_min = -1.0
         self.clamp_max = 1.0
 
         # (Optional) mild init to avoid early saturation
         nn.init.uniform_(self.action_head.weight, -0.02, 0.02)
         nn.init.constant_(self.action_head.bias, 0.0)
 
-    def forward(self, obs, terminal, z_dyn=None, return_pre_squash=False):
+    def forward(self, obs, terminal, insertion_sign=1, z_dyn=None, return_pre_squash=False):
         """
         obs:      (B, T, obs_dim)
         terminal: (B, 1, 1) or (B, 1)
@@ -547,6 +549,12 @@ class StochasticTwoHeadFiLMMLPPolicy(nn.Module):
         """
         B = obs.size(0)
         terminal = terminal.view(B, -1).float()  # (B,1)
+
+        # make sure d exists and has shape (B,1)
+        if insertion_sign is None:
+            insertion_sign = torch.ones(B, 1, device=obs.device, dtype=obs.dtype)
+        else:
+            insertion_sign = insertion_sign.view(B, 1).to(device=obs.device, dtype=obs.dtype)
 
         # Encoders
         x = obs.reshape(B, -1)                   # (B, T*obs_dim)
@@ -559,7 +567,7 @@ class StochasticTwoHeadFiLMMLPPolicy(nn.Module):
             h_z = torch.zeros(B, self.z_out_dim, device=obs.device, dtype=obs.dtype)
 
         # Base features from obs + terminal
-        h_base_in = torch.cat([h_obs, terminal], dim=-1)          # (B, obs_hidden+1)
+        h_base_in = torch.cat([h_obs, terminal, insertion_sign], dim=-1)          # (B, obs_hidden+1)
         h_base = self.base_trunk(h_base_in)                        # (B, H)
 
         # FiLM from z: per-feature scale & shift
@@ -581,12 +589,12 @@ class StochasticTwoHeadFiLMMLPPolicy(nn.Module):
         mean = y * (1.0 - terminal)                                # hard gate after terminal
         return mean
 
-    def get_dist(self, obs, terminal, z_dyn=None):
+    def get_dist(self, obs, terminal, insertion_sign=1, z_dyn=None):
         """
         Returns an unbounded Normal over the pre-squash output y_pre.
         Train your NLL in this latent space; clamp/sigmoid only for runtime actions.
         """
-        mean_pre = self.forward(obs, terminal, z_dyn, return_pre_squash=True)
+        mean_pre = self.forward(obs, terminal, insertion_sign=insertion_sign, z_dyn=z_dyn, return_pre_squash=True)
         log_std = torch.clamp(self.log_std, min=-0.92, max=2.0)    # keep your empirically good floor
         std = torch.exp(log_std).expand_as(mean_pre)
         return torch.distributions.Normal(mean_pre, std)
@@ -614,13 +622,13 @@ class StochasticMLPSeqPolicy(nn.Module):
             B, T, S, D = obs_seq.shape
             obs_seq = obs_seq.view(B * T, S * D)
             out = self.mean_head(self.encoder(obs_seq))
-            out = torch.clamp(out, 0.0, 30.0)
+            out = torch.clamp(out, 0.0, 40.0)
             return out.view(B, T, -1)
         elif obs_seq.dim() == 3:
             B, S, D = obs_seq.shape
             obs_seq = obs_seq.view(B, S * D)
             out = self.mean_head(self.encoder(obs_seq))
-            return torch.clamp(out, 0.0, 30.0)  # returns (B, act_dim)
+            return torch.clamp(out, 0.0, 40.0)  # returns (B, act_dim)
         else:
             raise ValueError(f"Unsupported input shape: {obs_seq.shape}")
 
@@ -630,12 +638,12 @@ class StochasticMLPSeqPolicy(nn.Module):
             B, T, S, D = obs_seq.shape
             obs_seq = obs_seq.view(B * T, S * D)
             mean = self.mean_head(self.encoder(obs_seq)).view(B, T, -1)
-            mean = torch.clamp(mean, 0.0, 30.0)
+            mean = torch.clamp(mean, 0.0, 40.0)
         elif obs_seq.dim() == 3:
             B, S, D = obs_seq.shape
             obs_seq = obs_seq.view(B, S * D)
             mean = self.mean_head(self.encoder(obs_seq))
-            mean = torch.clamp(mean, 0.0, 30.0)
+            mean = torch.clamp(mean, 0.0, 40.0)
         else:
             raise ValueError(f"Unsupported input shape: {obs_seq.shape}")
 

@@ -23,7 +23,8 @@ SETUP_LABELS = {"R_L_H_1_C_L_1": 1,
                 "R_M_M_1_C_S_2": 9,
                 "W_S_M_1_C_L_1": 10,
                 "W_S_M_1_C_L_2": 11,
-                "W_S_M_1_C_S_2": 12}
+                "W_S_M_1_C_S_2": 12,
+                "W_S_M_1_C_S_1": 13}
 
 def normalize_obs(obs):
     force_scale = 30.0
@@ -169,6 +170,10 @@ def compute_group_typed_reference_values(base_dir, env_step=5):
             if cable_id is None or clip_id is None:
                 print(f"\033[91mSkipping {mios_traj_dir} due to missing cable_id or clip_id.\033[0m")
                 continue
+            insertion_sign = load_insertion_sign(parameters)
+            if insertion_sign is None:
+                print(f"\033[91mSkipping {mios_traj_dir} due to missing insertion_sign.\033[0m")
+                continue
 
             if f"{cable_id}_{clip_id}" in SETUP_LABELS:
                 setup_label = SETUP_LABELS[f"{cable_id}_{clip_id}"]
@@ -177,7 +182,7 @@ def compute_group_typed_reference_values(base_dir, env_step=5):
             parameters["setup_label"] = setup_label
             json.dump(parameters, open(os.path.join(mios_traj_dir, "parameters.json"), 'w'), indent=4)
 
-            group_key = f"{cable_id}_{clip_id}_pose_{fixing_pose_id}" if fixing_pose_id else f"{cable_id}_{clip_id}"
+            group_key = f"{cable_id}_{clip_id}_pose_{fixing_pose_id}_{insertion_sign}" if fixing_pose_id else f"{cable_id}_{clip_id}"
 
             if group_key not in grouped_trajs:
                 grouped_trajs[group_key] = {
@@ -368,12 +373,28 @@ def load_and_preprocess_fixing_result(result_path):
     else:
         return False
 
-def load_setup_label(parameters_path):
-    parameters = json.load(open(parameters_path, 'r'))
-    setup_label = parameters.get("setup_label", None)
-    if setup_label is None:
-        raise ValueError(f"Missing setup_label in {parameters_path}")
-    return setup_label
+def load_setup_label(parameters):
+    # parameters = json.load(open(parameters_path, 'r'))
+    return parameters.get("setup_label", None)
+
+def load_insertion_sign(parameters):
+    insertion_sign = "+1"
+    insertion_force = parameters["p2"]["f_push"]
+
+    # ensure insertion_force is array-like (handle 0-d scalars)
+    insertion_force = np.asarray(insertion_force)
+    insertion_force_1d = np.atleast_1d(insertion_force)
+    non_zero_mask = insertion_force_1d != 0
+    non_zero_insertion_force = insertion_force_1d[non_zero_mask]
+    non_zero_insertion_index = np.nonzero(non_zero_mask)[0]
+    if non_zero_insertion_force.size == 0:
+        insertion_sign = None
+    elif non_zero_insertion_force[0] < 0:
+        insertion_sign = "-"+str(non_zero_insertion_index[0])
+    else:
+        insertion_sign = "+"+str(non_zero_insertion_index[0])
+
+    return insertion_sign
 
 def load_and_preprocess_terminal(traj_path, obs_buffer, acts_buffer, fixing_index=-1):
     terminal_file = os.path.join(traj_path, "terminal.txt")
@@ -507,7 +528,7 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
 
     obs_buffer_raw = np.loadtxt(os.path.join(traj_path, "observations.txt"))  # the last column is supposed to be the terminal, but was not stored correctly in the past
     acts_buffer_raw = np.loadtxt(os.path.join(traj_path, "actions.txt"))
-    terminals_buffer_raw = obs_buffer_raw[:, -1].astype(bool)  # last column is terminal, but was not stored correctly in the past
+    # terminals_buffer_raw = obs_buffer_raw[:, -1].astype(bool)  # last column is terminal, but was not stored correctly in the past
 
     print(f"Loaded fixing observation with {obs_buffer_raw.shape[0]} steps.")
 
@@ -517,7 +538,14 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
             continue
         else:
             fixing_success = load_and_preprocess_fixing_result(os.path.join(mios_traj_dir, "fixing_result.json"))
-            setup_label = load_setup_label(os.path.join(mios_traj_dir, "parameters.json"))
+            parameters_path = os.path.join(mios_traj_dir, "parameters.json")
+            parameters = json.load(open(parameters_path, 'r'))
+            setup_label = load_setup_label(parameters)
+            if setup_label is None:
+                raise ValueError(f"Missing setup_label in {parameters_path}")
+            insertion_sign = load_insertion_sign(parameters)
+            if insertion_sign is None:
+                raise ValueError(f"Missing insertion_sign in {parameters_path}")
 
     #         if post_sensing:
     #             post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index, loading_end_index = load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw, fixing_success)
@@ -535,7 +563,14 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
     #             terminals_raw = terminals_buffer_raw
     #             terminals_raw = terminals_raw.reshape(-1)
 
+        # post_obs_buffer_raw, post_acts_buffer_raw, fixing_terminal_index, loading_end_index = load_post_observation_and_action(mios_traj_dir, obs_buffer_raw, acts_buffer_raw, fixing_success)
 
+        fixing_terminal_index = -1
+        if fixing_success:
+            acts_mask = np.all(acts_buffer_raw == 0, axis=1)      # True for rows that are all zeros
+            idxs = np.nonzero(acts_mask)[0]
+            fixing_terminal_index = idxs[0] if idxs.size else -1  # first all zero index, -1 means "not found"
+        terminals_buffer_raw = load_and_preprocess_terminal(traj_path, obs_buffer_raw, acts_buffer_raw, fixing_terminal_index)
 
     # load from policy log and downsample
     obs_buffer_downsampled = preprocess_observation(obs_buffer_raw, env_step=env_step)
@@ -588,9 +623,14 @@ def load_one_episode(traj_path, env_step=5, post_sensing=True, include_deformati
     #     obs_buffer = np.concatenate([obs_buffer, post_obs_buffer], axis=0)
     #     acts_buffer = np.concatenate([acts_buffer, post_acts_buffer], axis=0)
 
+    # push or pull for insertion
+    insertion_sign = +1 if insertion_sign.startswith("+") else -1
+    obs_buffer[:, 3:] = insertion_sign * obs_buffer[:, 3:]  # push force, distance, velocity
+    acts_buffer[:, 1] = insertion_sign * acts_buffer[:, 1]  # push force
+
     # plotting
     plot_force(obs_buffer, acts_buffer, base_dir, traj_dir, terminal_index, ending_index)
-    return obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_success, setup_label
+    return obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_success, setup_label, insertion_sign
 
 def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, load_terminal_in_obs=False):
     if not reload_data and os.path.exists(os.path.join(base_dir, "episode_dataset.npz")):
@@ -603,7 +643,8 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
             terminals=data["terminals"],
             returns=data["returns"],
             load_terminals=load_terminal_in_obs,
-            labels=data["label"]
+            labels=data["label"],
+            insertion_signs=data["insertion_sign"]
         )
     else:
         # === Step 1: compute reference values across all episodes ===
@@ -612,7 +653,7 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
         with open(os.path.join(base_dir, "reference_values.json"), 'w') as f:
             json.dump(grouped_ref_values, f, indent=4)
 
-        all_observations, all_actions, all_returns, all_terminals, all_labels = [], [], [], [], []
+        all_observations, all_actions, all_returns, all_terminals, all_labels, all_signs = [], [], [], [], [], []
 
         for traj_dir in sorted(os.listdir(base_dir)):
             traj_path = os.path.join(base_dir, traj_dir)
@@ -626,7 +667,7 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
                     traj_ref_values = ref_values["refs"].copy()
                     break
 
-            obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_result, setup_label = load_one_episode(traj_path, 
+            obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_result, setup_label, insertion_sign = load_one_episode(traj_path, 
                                                                                                     env_step=env_step,
                                                                                                     post_sensing=True,
                                                                                                     include_deformation_in_return=True,
@@ -643,6 +684,7 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
             all_returns.append(ep_return)
             all_terminals.append(terminals_buffer)
             all_labels.append(setup_label)
+            all_signs.append(insertion_sign)
 
             # check if their size is consistent
             if not (obs_buffer.shape[0] == acts_buffer.shape[0]== terminals_buffer.shape[0]):
@@ -657,7 +699,8 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
             actions=np.array(all_actions, dtype=object),
             terminals=np.array(all_terminals, dtype=object),    
             returns=np.array(all_returns, dtype=np.float32),
-            label=np.array(all_labels, dtype=object)  # save the setup label for each trajectory
+            label=np.array(all_labels, dtype=object),  # save the setup label for each trajectory
+            insertion_sign=np.array(all_signs, dtype=object)  # save the insertion sign for each trajectory
         )
         print(f"Reloaded episode dataset saved to {os.path.join(base_dir, 'episode_dataset.npz')}")
 
@@ -667,7 +710,8 @@ def load_trajectories(base_dir, return_function, env_step=5, reload_data=True, l
                             returns=all_returns,
                             timeouts=None,
                             load_terminals=load_terminal_in_obs,
-                            labels=all_labels
+                            labels=all_labels,
+                            insertion_signs=all_signs
                             )  # timeouts are not used in this case
 
 def plot_force(obs, act, base_dir, traj_dir, terminal_index, ending_index):

@@ -83,11 +83,11 @@ def collate_variable_episodes(batch, include_terminal=False):
         mask: (B, T_max) — bool
         lengths: (B,) — original episode lengths
     """
-    obs_list, act_list, weights, original_lengths, fixing_lengths, labels = [], [], [], [], [], []
+    obs_list, act_list, weights, original_lengths, fixing_lengths, labels, insertion_signs = [], [], [], [], [], [], []
 
     for data in batch:
         if include_terminal:
-            obs, act, weight, terminals, label = data
+            obs, act, weight, terminals, label, insertion_sign = data
             terminals = terminals.view(-1, 1)
             # print("max stretching velocity:", abs(obs[:, 2]).max().item(), "min stretching velocity:", abs(obs[:, 2]).min().item())
             # print("max pushing velocity:", abs(obs[:, 5]).max().item(), "min pushing velocity:", abs(obs[:, 5]).min().item())
@@ -100,7 +100,7 @@ def collate_variable_episodes(batch, include_terminal=False):
             last_obs = obs[-1, :-1].unsqueeze(0)  # last observation without terminal
             # print(f"Original episode length: {original_ep_len}, Fixing episode length: {fixing_ep_len}")
         else:
-            obs, act, weight, label = data
+            obs, act, weight, label, insertion_sign = data
             original_ep_len = obs.shape[0]
             fixing_ep_len = original_ep_len
 
@@ -110,10 +110,12 @@ def collate_variable_episodes(batch, include_terminal=False):
         original_lengths.append(original_ep_len)
         fixing_lengths.append(fixing_ep_len)
         labels.append(label)
+        insertion_signs.append(insertion_sign)
 
     original_lengths = torch.tensor(original_lengths, dtype=torch.int64)
     fixing_lengths = torch.tensor(fixing_lengths, dtype=torch.int64)
     labels = torch.tensor(labels, dtype=torch.int64)
+    insertion_signs = torch.tensor(insertion_signs, dtype=torch.int64)
     obs_padded = pad_sequence(obs_list, batch_first=True)
     act_padded = pad_sequence(act_list, batch_first=True)
 
@@ -135,7 +137,7 @@ def collate_variable_episodes(batch, include_terminal=False):
         terminals_padded = terminals_padded.masked_fill(~encoder_mask, 1.0)                    # pads -> 1.0
         obs_padded[..., -1] = terminals_padded
 
-    return obs_padded, act_padded, torch.tensor(weights), policy_mask, encoder_mask, original_lengths, fixing_lengths, labels
+    return obs_padded, act_padded, torch.tensor(weights), policy_mask, encoder_mask, original_lengths, fixing_lengths, labels, insertion_signs
 
 def masked_update(prev, new, mask, batch_dim=0):
     """
@@ -156,7 +158,7 @@ def masked_update(prev, new, mask, batch_dim=0):
     return torch.where(m, new, prev)
 
 def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, policy_window_length, encoder_window_length, 
-                                             policy_mask, encoder_mask, policy, encoder, labels,
+                                             policy_mask, encoder_mask, policy, encoder, labels, insertion_signs,
                                              policy_type="gru", use_encoder="gru", train=True, z_dummy=None):
     """
     Args:
@@ -231,16 +233,18 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
             if train:
                 pred_dist_t, policy_h = policy.get_dist_step(obs_step, z_dyn, policy_h)  # (B, act_dim)
             else:
-                pred_step, policy_h = policy(obs_step, z_dyn, policy_h)  # (B, act_dim)
+                pred_step, policy_h = policy(obs_step, z_dyn, policy_h, return_pre_squash=True)  # (B, act_dim)
         elif policy_type == "stochastic_mlp" or policy_type == "stochastic_two_head_mlp" or policy_type == "stochastic_two_head_transform_mlp" or policy_type == "stochastic_two_head_film_mlp":
             terminal_t = obs_step[:, -1].unsqueeze(1)  # (B, 1)
             terminal_t = terminal_t.unsqueeze(1)  # (B, 1, 1)
+            insertion_signs =  insertion_signs.unsqueeze(1)  # (B, 1)
+            insertion_signs =  insertion_signs.unsqueeze(1)  # (B, 1)
             if policy_window_length >= 1:
                 windowed_input = get_obs_padded_window(obs_padded, t, policy_window_length, window_obs_dim=obs_dim-1)
                 if train:
-                    pred_dist_t = policy.get_dist(windowed_input, terminal_t, z_dyn)
+                    pred_dist_t = policy.get_dist(windowed_input, terminal_t, insertion_signs, z_dyn)  # (B, act_dim)
                 else:
-                    pred_step = policy(windowed_input, terminal_t, z_dyn)
+                    pred_step = policy(windowed_input, terminal_t, insertion_signs, z_dyn)  # (B, act_dim)
             # else:
             #     single_input = obs_step.unsqueeze(1)  # (B, 1, obs_dim)
             #     if train:
@@ -271,7 +275,7 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
 
         eps = 1e-8
         weighted_loss = (loss_masked * weight_masked).sum() / (weight_masked.sum() + eps)
-        entropy_coef = 0.005
+        entropy_coef = 0.00
         entropy_reg = entropy_masked.mean()
         final_loss = weighted_loss - entropy_coef * entropy_reg
     else:
@@ -285,12 +289,12 @@ def compute_weighted_masked_bc_loss_stepwise(obs_padded, act_padded, weights, po
         final_loss = weighted_loss
     return forward_output, final_loss, weight_masked.sum().item()
 
-def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_window_len, encoder_window_len, num_epochs=50, batch_size=8, lr=1e-3, policy_type="deterministic", use_encoder="gru", log_dir=None, save_epoch=50):
+def train_weighted_bc(policy, encoder, train_dataloader, eval_dataloader, obs_dim, act_dim, policy_window_len, encoder_window_len, num_epochs=50, batch_size=8, lr=1e-3, policy_type="deterministic", use_encoder="gru", log_dir=None, save_epoch=50):
     policy.train()
     if encoder is not None:
         encoder.train()
     
-    optimizer = optim.Adam(policy.parameters(), lr=lr)
+    optimizer = optim.Adam(list(policy.parameters()) + list(encoder.parameters()), lr=lr)
 
     # Early stopping variables
     best_loss = float('inf')  # Initialize best loss to infinity
@@ -305,12 +309,12 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_wind
         epoch_loss = 0.0
 
         total_weight = 0.0
-        for obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels in dataloader:
-            obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels = obs_batch.to(device), act_batch.to(device), weights.to(device), policy_mask.to(device), encoder_mask.to(device), original_lengths.to(device), fixing_lengths.to(device), labels.to(device)
+        for obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels, insertion_signs in train_dataloader:
+            obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels, insertion_signs = obs_batch.to(device), act_batch.to(device), weights.to(device), policy_mask.to(device), encoder_mask.to(device), original_lengths.to(device), fixing_lengths.to(device), labels.to(device), insertion_signs.to(device)
             optimizer.zero_grad()
             # weighted_loss, batch_weight = compute_weighted_masked_bc_loss(obs_batch, act_batch, weights, lengths, mask, policy, encoder, policy_type)
             policy_pred, weighted_loss, batch_weight = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_len, encoder_window_len, 
-                                                                                   policy_mask, encoder_mask, policy, encoder, labels, policy_type, use_encoder, train=True)
+                                                                                   policy_mask, encoder_mask, policy, encoder, labels, insertion_signs, policy_type, use_encoder, train=True)
             weighted_loss.backward()
             optimizer.step()
 
@@ -319,7 +323,7 @@ def train_weighted_bc(policy, encoder, dataloader, obs_dim, act_dim, policy_wind
 
         avg_loss = epoch_loss / max(total_weight, 1e-8)
 
-        val_loss = evaluate_weighted_bc(policy, encoder, dataloader, masked_mse, policy_window_length=policy_window_len, encoder_window_length=encoder_window_len, policy_type=policy_type, use_encoder=use_encoder, if_plot=False)
+        val_loss = evaluate_weighted_bc(policy, encoder, eval_dataloader, masked_mse, policy_window_length=policy_window_len, encoder_window_length=encoder_window_len, policy_type=policy_type, use_encoder=use_encoder, if_plot=False)
         print(f"Epoch {epoch}: Epoch loss {epoch_loss:.4f}, Weighted Avg Loss = {avg_loss:.8f}, Val Loss = {val_loss:.8f}")
         wandb.log({"epoch": epoch, "weighted_bc_loss": avg_loss, "val_loss": val_loss})
 
@@ -394,7 +398,7 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
     # total_weight2 = 0.0
 
     with torch.no_grad():
-        for obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels in val_loader:
+        for obs_batch, act_batch, weights, policy_mask, encoder_mask, original_lengths, fixing_lengths, labels, insertion_signs in val_loader:
             obs_batch = obs_batch.to(device)       # (1, T, obs_dim)
             act_batch = act_batch.to(device)       # (1, T, act_dim)
             weights = weights.to(device)           # (1,)
@@ -403,10 +407,11 @@ def evaluate_weighted_bc(policy, encoder, val_loader, loss_fn, policy_window_len
             original_lengths = original_lengths.to(device)           # (1,)
             fixing_lengths = fixing_lengths.to(device)           # (1,)
             labels = labels.to(device)             # (1,)
+            insertion_signs = insertion_signs.to(device)       # (1,)
 
             # new_labels1 = torch.tensor([11]).to(device)
             pred, masked_weighted_loss, masked_weight = compute_weighted_masked_bc_loss_stepwise(obs_batch, act_batch, weights, policy_window_length, encoder_window_length,
-                                                                                                policy_mask, encoder_mask, policy, encoder, labels, policy_type, use_encoder, train=False,
+                                                                                                policy_mask, encoder_mask, policy, encoder, labels, insertion_signs,policy_type, use_encoder, train=False,
                                                                                                 z_dummy=torch.zeros((obs_batch.size(0), 1, 5), device=device))  # z_dummy for slope encoder
             total_loss += masked_weighted_loss.item()
             total_weight += masked_weight
@@ -465,7 +470,7 @@ def policy_wrapper(obs_dim, act_dim, seq_window_len, policy_type="stochastic_gru
     return policy
 
 def encoder_wrapper(obs_dim, act_dim, use_encoder="gru", pretrained_encoder=False, train_encoder=True, encoder_z_dim=5, encoder_hidden_dim=64):
-    if use_encoder == "null":
+    if use_encoder == "null" or use_encoder == "slope":
         encoder = None
     else:
         if use_encoder == "gru_dynamics":
@@ -493,9 +498,9 @@ if __name__ == "__main__":
     train_encoder = True
     if use_encoder == "null":
         pretrained_encoder = False
-        train_encoder = False  # if no encoder is used, no need to train it
+        train_encoder = False  
     if not pretrained_encoder:
-        train_encoder = True  # if not using a pretrained encoder, must train it 
+        train_encoder = True  # if not using a pretrained encoder, train from scratch
     train_epochs = 200
     learning_rate = 1e-3
     batch_size = 8
@@ -512,7 +517,7 @@ if __name__ == "__main__":
     
     '''---------------------------------------------prepare the dataset---------------------------------------'''
 
-    dataset_base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/off_policy_4/"
+    dataset_base_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/off_policy_5/"
     return_function = effort_and_energy_based_return_function  # effort_and_energy_based_return_function or effort_based_return_function
     dataset = load_trajectories(dataset_base_dir, return_function, env_step=update_step, reload_data=reload_data, load_terminal_in_obs=load_fixing_terminal_in_obs) # observation (B, D)
 
@@ -564,7 +569,8 @@ if __name__ == "__main__":
         })
 
         collate_function = partial(collate_variable_episodes, include_terminal=load_fixing_terminal_in_obs)
-        train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_function)
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_function)
+        val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=True, collate_fn=partial(collate_variable_episodes, include_terminal=load_fixing_terminal_in_obs))
         
         encoder = encoder_wrapper(obs_dim, act_dim, use_encoder=use_encoder, pretrained_encoder=pretrained_encoder, train_encoder=train_encoder, encoder_z_dim=encoder_z_dim, encoder_hidden_dim=encoder_hidden_dim)
 
@@ -574,6 +580,7 @@ if __name__ == "__main__":
                                 policy,
                                 encoder,
                                 train_dataloader,
+                                val_dataloader,
                                 obs_dim=obs_dim,
                                 act_dim=act_dim,
                                 policy_window_len=seq_window_len,
@@ -606,7 +613,7 @@ if __name__ == "__main__":
     '''---------------------------------------------Evaluate the policy-------------------------------------'''
     # paths
     if not train:
-        log_stored_folder = "20250813_203125" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
+        log_stored_folder = "20251112_170552" # "20250805_174938" #20250629_170553 #20250702_160901 20250707_215329 #20250709_141454 # 20250725_162934 #20250727_182152
         log_dir = os.path.join(log_base_dir, log_stored_folder)
     
     policy_path = os.path.join(log_dir, "best_policy.pth")
