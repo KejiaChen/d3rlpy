@@ -781,7 +781,8 @@ def plot_avg_returns_per_cable_same_bar_width(
     clips_per_cable = {cid: len(cable_to_clips[cid]) for cid in cable_ids}
 
     # number of empty "gap slots" between subfigures in a row
-    gap_slots = 1  # you can set to 0 for tighter layout, 1 for some gap
+    # we don't use empty grid columns as gaps anymore
+    gap_slots = 0
 
     def row_slots(cables_row):
         if not cables_row:
@@ -861,6 +862,7 @@ def plot_avg_returns_per_cable_same_bar_width(
                 means_random,
                 width=bar_width,
                 yerr=std_random,
+                fmt="none",
                 capsize=3,
                 label=labels[0],
             )
