@@ -17,7 +17,7 @@ TICK_FONTSIZE = 20
 LINEWIDTH = 2
 
 
-def plot_avg_returns_per_cable_same_bar_width(
+def plot_avg_returns_per_cable_bar(
     random_returns,
     trained_returns,
     labels=("Random", "Trained"),
@@ -30,90 +30,100 @@ def plot_avg_returns_per_cable_same_bar_width(
 
     - X axis: clip_id
     - Bars: random vs trained
-    - Each bar is a stack of [total_energy, total_effort]
-    - Error bars: std of TOTAL (energy + effort) across trials
+    - Each bar value = average over trials of the SUM of `properties`
+        e.g. total_energy + total_effort, or whatever you pass in.
+    - Error bars: std of that sum across trials
     - Exactly 2 rows of subplots.
     - Subplot width is proportional to number of clips.
     - Bars have the same visual width across ALL subplots
       (achieved by a single 2xN GridSpec of uniform 'clip slots').
 
-    With:
-    - Extra horizontal gaps between subfigures in a row
-    - Wider overall figure and more left/right margin
-    - SAME y-axis (limits + ticks) for all subplots
-      (only leftmost subplot in each row shows y tick labels)
+    Assumes each entry in random_returns / trained_returns looks like:
+        {
+            "cable_id": ...,
+            "clip_id": ...,
+            "<prop1>": [ ... ],   # per trial
+            "<prop2>": [ ... ],
+            ...
+        }
+    where <propX> are the names in `properties`.
     """
 
-    # 1) Aggregate raw data: (cable_id, clip_id) -> lists for each policy and component
+    properties = tuple(properties)  # just to be safe
+
+    # 1) Aggregate raw data: (cable_id, clip_id) -> list of summed values per trial
     agg = defaultdict(lambda: {
-        "random_energy": [],
-        "random_effort": [],
-        "trained_energy": [],
-        "trained_effort": [],
+        "random_total": [],
+        "trained_total": [],
     })
 
     def add_policy_data(source_dict, policy_prefix):
-        for _, data in source_dict.items():
-            cable_id = data.get("cable_id")
-            clip_id  = data.get("clip_id")
+        for group_key, data in source_dict.items():
+            # cable_id = data.get("cable_id")
+            # clip_id  = data.get("clip_id")
+            cable_id = group_key[:7]
+            clip_id  = group_key[8:13]
             if cable_id is None or clip_id is None:
                 continue
 
-            energies = data.get("total_energy", [])
-            efforts  = data.get("total_effort", [])
+            # collect lists for all requested properties
+            prop_lists = []
+            for prop in properties:
+                vals = data.get(prop, [])
+                vals = [float(v) for v in vals]
+                prop_lists.append(vals)
+
+            # drop if no property has data
+            non_empty = [lst for lst in prop_lists if len(lst) > 0]
+            if not non_empty:
+                continue
+
+            # ensure same number of trials by truncating to min length
+            n_trials = min(len(lst) for lst in non_empty)
+            if n_trials == 0:
+                continue
+
+            # compute per-trial sum over properties
+            summed = []
+            for i in range(n_trials):
+                s = 0.0
+                for lst in prop_lists:
+                    if i < len(lst):
+                        s += lst[i]
+                summed.append(s)
 
             key = (cable_id, clip_id)
-            agg[key][f"{policy_prefix}_energy"].extend([float(v) for v in energies])
-            agg[key][f"{policy_prefix}_effort"].extend([float(v) for v in efforts])
+            agg[key][f"{policy_prefix}_total"].extend(summed)
 
     # Random + trained
     add_policy_data(random_returns,  "random")
     add_policy_data(trained_returns, "trained")
 
-    # 2) Per-cable structure: totals + parts
+    # 2) Per-cable structure: mean/std of the summed properties
     # cable_id -> clip_id -> dict(...)
     cable_to_clips = defaultdict(dict)
     for (cable_id, clip_id), d in agg.items():
         # --- random ---
-        r_en  = d["random_energy"]
-        r_eff = d["random_effort"]
-
-        if r_en and r_eff:
-            # per-trial totals = energy + effort
-            r_tot = [e + f for e, f in zip(r_en, r_eff)]
-            mean_r = np.mean(r_tot)
-            std_r  = np.std(r_tot, ddof=0)
-            mean_r_parts = np.array([
-                np.mean(r_en),
-                np.mean(r_eff),
-            ], dtype=float)
+        r_tot = d["random_total"]
+        if r_tot:
+            mean_r = float(np.mean(r_tot))
+            std_r  = float(np.std(r_tot, ddof=0))
         else:
             mean_r, std_r = np.nan, np.nan
-            mean_r_parts  = np.array([np.nan, np.nan])
 
         # --- trained ---
-        t_en  = d["trained_energy"]
-        t_eff = d["trained_effort"]
-
-        if t_en and t_eff:
-            t_tot = [e + f for e, f in zip(t_en, t_eff)]
-            mean_t = np.mean(t_tot)
-            std_t  = np.std(t_tot, ddof=0)
-            mean_t_parts = np.array([
-                np.mean(t_en),
-                np.mean(t_eff),
-            ], dtype=float)
+        t_tot = d["trained_total"]
+        if t_tot:
+            mean_t = float(np.mean(t_tot))
+            std_t  = float(np.std(t_tot, ddof=0))
         else:
             mean_t, std_t = np.nan, np.nan
-            mean_t_parts  = np.array([np.nan, np.nan])
 
         cable_to_clips[cable_id][clip_id] = {
-            "mean_random":        mean_r,
-            "std_random":         std_r,
-            "mean_trained":       mean_t,
-            "std_trained":        std_t,
-            "mean_random_parts":  mean_r_parts,   # [total_energy, total_effort]
-            "mean_trained_parts": mean_t_parts,   # [total_energy, total_effort]
+            "mean_random":  mean_r,
+            "std_random":   std_r,
+            "mean_trained": mean_t,
+            "std_trained":  std_t,
         }
 
     if not cable_to_clips:
@@ -130,7 +140,6 @@ def plot_avg_returns_per_cable_same_bar_width(
 
     clips_per_cable = {cid: len(cable_to_clips[cid]) for cid in cable_ids}
 
-    # number of empty "gap slots" between subfigures in a row
     gap_slots = 0
 
     def row_slots(cables_row):
@@ -140,7 +149,6 @@ def plot_avg_returns_per_cable_same_bar_width(
 
     total_clips_row0 = row_slots(row0_cables)
     total_clips_row1 = row_slots(row1_cables)
-
     total_slots = max(total_clips_row0, total_clips_row1)
 
     # Wider figure: more horizontal room overall
@@ -204,7 +212,7 @@ def plot_avg_returns_per_cable_same_bar_width(
                         all_y_vals.append(m + s)
                         all_y_vals.append(m - s)
 
-            # Bars + error bars
+            # Bars + error bars (sum of properties)
             ax.bar(
                 x - bar_width / 2,
                 means_random,
@@ -296,10 +304,11 @@ def plot_avg_returns_per_cable_same_bar_width(
     plt.savefig(save_path)
     plt.show()
 
-def plot_avg_returns_per_cable_same_bar_width_split(
+def plot_avg_returns_per_cable_bar_split(
     random_returns,
     trained_returns,
     labels=("Random", "Trained"),
+    properties=("total_energy", "total_effort"),
     title="Average returns per clip for each cable",
     save_path="avg_returns_per_cable.png"
 ):
@@ -308,27 +317,35 @@ def plot_avg_returns_per_cable_same_bar_width_split(
 
     - X axis: clip_id
     - Bars: random vs trained
-    - Each bar is a stack of [total_energy, total_effort]
-    - Error bars: std of TOTAL (energy + effort) across trials
+    - Each bar is a stack of the given `properties`, e.g. ("total_energy", "total_effort")
+    - Error bars: std of the TOTAL (sum over `properties`) across trials
     - Exactly 2 rows of subplots.
     - Subplot width is proportional to number of clips.
     - Bars have the same visual width across ALL subplots
       (achieved by a single 2xN GridSpec of uniform 'clip slots').
 
-    With:
-    - Extra horizontal gaps between subfigures in a row
-    - Wider overall figure and more left/right margin
-    - SAME y-axis (limits + ticks) for all subplots
-      (only leftmost subplot in each row shows y tick labels)
+    Assumes each entry in random_returns / trained_returns looks like:
+        {
+            "cable_id": ...,
+            "clip_id": ...,
+            "<prop1>": [ ... ],   # per trial
+            "<prop2>": [ ... ],
+            ...
+        }
+    where <propX> are the names in `properties`.
     """
 
-    # 1) Aggregate raw data: (cable_id, clip_id) -> lists for each policy and component
-    agg = defaultdict(lambda: {
-        "random_energy": [],
-        "random_effort": [],
-        "trained_energy": [],
-        "trained_effort": [],
-    })
+    properties = tuple(properties)  # ensure it's indexable
+
+    def make_empty():
+        d = {}
+        for policy in ("random", "trained"):
+            for p in properties:
+                d[f"{policy}_{p}"] = []
+        return d
+
+    # 1) Aggregate raw data: (cable_id, clip_id) -> lists for each policy and property
+    agg = defaultdict(make_empty)
 
     def add_policy_data(source_dict, policy_prefix):
         for _, data in source_dict.items():
@@ -337,12 +354,10 @@ def plot_avg_returns_per_cable_same_bar_width_split(
             if cable_id is None or clip_id is None:
                 continue
 
-            energies = data.get("total_energy", [])
-            efforts  = data.get("total_effort", [])
-
             key = (cable_id, clip_id)
-            agg[key][f"{policy_prefix}_energy"].extend([float(v) for v in energies])
-            agg[key][f"{policy_prefix}_effort"].extend([float(v) for v in efforts])
+            for prop in properties:
+                vals = data.get(prop, [])
+                agg[key][f"{policy_prefix}_{prop}"].extend([float(v) for v in vals])
 
     # Random + trained
     add_policy_data(random_returns,  "random")
@@ -351,47 +366,45 @@ def plot_avg_returns_per_cable_same_bar_width_split(
     # 2) Per-cable structure: totals + parts
     # cable_id -> clip_id -> dict(...)
     cable_to_clips = defaultdict(dict)
+
     for (cable_id, clip_id), d in agg.items():
-        # --- random ---
-        r_en  = d["random_energy"]
-        r_eff = d["random_effort"]
+        # --- helper for one policy ---
+        def compute_policy_stats(prefix):
+            # list of arrays, one per property
+            arrays = [np.array(d[f"{prefix}_{prop}"], dtype=float)
+                      for prop in properties]
 
-        if r_en and r_eff:
-            # per-trial totals = energy + effort
-            r_tot = [e + f for e, f in zip(r_en, r_eff)]
-            mean_r = np.mean(r_tot)
-            std_r  = np.std(r_tot, ddof=0)
-            mean_r_parts = np.array([
-                np.mean(r_en),
-                np.mean(r_eff),
-            ], dtype=float)
-        else:
-            mean_r, std_r = np.nan, np.nan
-            mean_r_parts  = np.array([np.nan, np.nan])
+            # keep only non-empty arrays to determine common length
+            non_empty = [a for a in arrays if len(a) > 0]
+            if not non_empty:
+                return np.nan, np.nan, np.full(len(properties), np.nan, dtype=float)
 
-        # --- trained ---
-        t_en  = d["trained_energy"]
-        t_eff = d["trained_effort"]
+            # use the minimum length across properties (truncate to align)
+            n = min(len(a) for a in non_empty)
+            arrays = [a[:n] for a in arrays]
 
-        if t_en and t_eff:
-            t_tot = [e + f for e, f in zip(t_en, t_eff)]
-            mean_t = np.mean(t_tot)
-            std_t  = np.std(t_tot, ddof=0)
-            mean_t_parts = np.array([
-                np.mean(t_en),
-                np.mean(t_eff),
-            ], dtype=float)
-        else:
-            mean_t, std_t = np.nan, np.nan
-            mean_t_parts  = np.array([np.nan, np.nan])
+            # shape = (n_properties, n_trials)
+            mat = np.vstack(arrays)
+
+            # per-trial total = sum over properties
+            totals = mat.sum(axis=0)
+
+            mean_total = float(np.mean(totals))
+            std_total  = float(np.std(totals, ddof=0))
+            means_parts = mat.mean(axis=1)  # one mean per property
+
+            return mean_total, std_total, means_parts
+
+        mean_r, std_r, mean_r_parts = compute_policy_stats("random")
+        mean_t, std_t, mean_t_parts = compute_policy_stats("trained")
 
         cable_to_clips[cable_id][clip_id] = {
             "mean_random":        mean_r,
             "std_random":         std_r,
             "mean_trained":       mean_t,
             "std_trained":        std_t,
-            "mean_random_parts":  mean_r_parts,   # [total_energy, total_effort]
-            "mean_trained_parts": mean_t_parts,   # [total_energy, total_effort]
+            "mean_random_parts":  mean_r_parts,   # len = len(properties)
+            "mean_trained_parts": mean_t_parts,
         }
 
     if not cable_to_clips:
@@ -408,7 +421,6 @@ def plot_avg_returns_per_cable_same_bar_width_split(
 
     clips_per_cable = {cid: len(cable_to_clips[cid]) for cid in cable_ids}
 
-    # number of empty "gap slots" between subfigures in a row
     gap_slots = 0
 
     def row_slots(cables_row):
@@ -418,10 +430,8 @@ def plot_avg_returns_per_cable_same_bar_width_split(
 
     total_clips_row0 = row_slots(row0_cables)
     total_clips_row1 = row_slots(row1_cables)
-
     total_slots = max(total_clips_row0, total_clips_row1)
 
-    # Wider figure: more horizontal room overall
     fig = plt.figure(figsize=(0.9 * total_slots + 7, 9))
     gs = fig.add_gridspec(2, total_slots, width_ratios=[1] * total_slots)
 
@@ -429,11 +439,12 @@ def plot_avg_returns_per_cable_same_bar_width_split(
     axes_row0 = []
     axes_row1 = []
 
-    # We'll collect all values (means ± std) to compute a global y-range
     all_y_vals = []
 
+    def prettify(name: str) -> str:
+        return name.replace("_", " ").capitalize()
+
     def plot_row(cable_ids_row, row_index):
-        """Place each cable in this row, spanning slots equal to its #clips, with gaps."""
         nonlocal all_y_vals
         row_axes = []
         col_start = 0
@@ -468,7 +479,7 @@ def plot_avg_returns_per_cable_same_bar_width_split(
             means_trained = np.array(means_trained, dtype=float)
             std_trained = np.array(std_trained, dtype=float)
 
-            # collect values for global y-limits (mean ± std)
+            # global y-limits based on mean ± std
             for m, s in zip(means_random, std_random):
                 if not np.isnan(m):
                     all_y_vals.append(m)
@@ -482,13 +493,12 @@ def plot_avg_returns_per_cable_same_bar_width_split(
                         all_y_vals.append(m + s)
                         all_y_vals.append(m - s)
 
-            # --- STACKED BARS FOR 2 COMPONENTS (energy, effort) ---
+            # --- STACKED BARS FOR N PROPERTIES ---
 
-            # x positions for each policy
             x_random  = x - bar_width / 2
             x_trained = x + bar_width / 2
 
-            # shape (2, n_clips): rows = [total_energy, total_effort]
+            # shape: (n_properties, n_clips)
             means_random_parts  = np.vstack(
                 [clip_dict[cid]["mean_random_parts"] for cid in clip_ids]
             ).T
@@ -496,7 +506,7 @@ def plot_avg_returns_per_cable_same_bar_width_split(
                 [clip_dict[cid]["mean_trained_parts"] for cid in clip_ids]
             ).T
 
-            part_labels = ["Total energy", "Total effort"]
+            part_labels = [prettify(p) for p in properties]
             n_parts = means_random_parts.shape[0]
 
             bottom_r = np.zeros_like(x, dtype=float)
@@ -522,7 +532,6 @@ def plot_avg_returns_per_cable_same_bar_width_split(
                 bottom_t += means_trained_parts[i]
 
             # --- TOTAL ERROR BARS ON TOP OF STACKS ---
-
             ax.errorbar(
                 x_random,
                 means_random,
@@ -547,7 +556,6 @@ def plot_avg_returns_per_cable_same_bar_width_split(
             ax.set_xticklabels(clip_ids, rotation=0, ha="center", fontsize=TICK_FONTSIZE)
             ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
 
-            # move start to end + gap_slots
             col_start = col_end + gap_slots
 
         return row_axes
@@ -562,27 +570,21 @@ def plot_avg_returns_per_cable_same_bar_width_split(
         if global_max <= 0:
             global_max = 1.0
 
-        # Global y limits: always start at zero for bar charts
         ylim = (0, global_max * 1.05)
 
-        # Apply the same limits to all axes
         for ax in axes:
             ax.set_ylim(ylim)
 
-        # Force draw so ticks are computed
         fig.canvas.draw()
 
-        # Take ticks from the first axis as global ticks
         ref_ax = axes[0]
         ref_ticks = ref_ax.get_yticks()
         ref_ticklabels = [lab.get_text() for lab in ref_ax.get_yticklabels()]
 
-        # Apply same ticks everywhere
         for ax in axes:
             ax.set_yticks(ref_ticks)
             ax.set_yticklabels(ref_ticklabels, fontsize=TICK_FONTSIZE)
 
-        # Only leftmost subplot in each row shows labels
         if len(axes_row0) > 1:
             for ax in axes_row0[1:]:
                 ax.set_yticklabels([])
@@ -602,7 +604,6 @@ def plot_avg_returns_per_cable_same_bar_width_split(
         handles.extend(h)
         labels_all.extend(l)
 
-    # Remove duplicates while preserving order
     seen = set()
     unique_handles = []
     unique_labels = []
@@ -621,10 +622,9 @@ def plot_avg_returns_per_cable_same_bar_width_split(
         fontsize=LEGEND_FONTSIZE,
     )
 
-    # Layout: keep margins for ylabel and legend, and add vertical spacing
     fig.subplots_adjust(
-        left=0.06,   # room for y-label
-        right=0.95,  # space on the right for legend
+        left=0.06,
+        right=0.95,
         top=0.85,
         bottom=0.08,
         hspace=0.3,
@@ -633,4 +633,3 @@ def plot_avg_returns_per_cable_same_bar_width_split(
 
     plt.savefig(save_path)
     plt.show()
-
