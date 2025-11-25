@@ -3,6 +3,25 @@ import numpy as np
 import matplotlib.pyplot as plt
 import math
 
+import matplotlib as mpl
+
+mpl.rcParams['font.family'] = 'Times New Roman'
+mpl.rcParams['font.serif'] = ['Times New Roman']
+mpl.rcParams['mathtext.fontset'] = 'custom'
+mpl.rcParams['mathtext.rm'] = 'Times New Roman'
+mpl.rcParams['mathtext.it'] = 'Times New Roman:italic'
+mpl.rcParams['mathtext.bf'] = 'Times New Roman:bold'
+
+mpl.rcParams['pdf.fonttype'] = 42  
+mpl.rcParams['ps.fonttype'] = 42
+
+FIG_TITLE_FONTSIZE = 28
+SUBFIG_TITLE_FONTSIZE = 26
+LABEL_FONTSIZE = 20
+LEGEND_FONTSIZE = 24
+TICK_FONTSIZE = 26
+LINEWIDTH = 2
+
 
 # ================================
 #  SHARED AGGREGATION + STATS
@@ -120,6 +139,17 @@ def _compute_stats(agg, properties):
         }
 
     return cable_to_clips
+
+import matplotlib.colors as mcolors
+
+def _with_alpha(color, alpha=0.4):
+    """
+    Return the input color but with a different transparency (alpha).
+    Accepts any Matplotlib color spec: name, hex, RGB tuple, etc.
+    """
+    rgba = mcolors.to_rgba(color)
+    return (rgba[0], rgba[1], rgba[2], alpha)
+
 
 
 # ================================
@@ -245,7 +275,8 @@ def plot_avg_returns_per_cable(
                 label=labels[1],
             )
 
-            ax.set_title(cable)
+            if row_index == 0:
+                ax.set_title(cable, fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
             ax.set_xticks(x)
             ax.set_xticklabels(clip_ids)
 
@@ -343,9 +374,10 @@ def plot_avg_returns_per_cable(
                 ecolor="black",
             )
 
-            ax.set_title(cable)
+            if row_index == 0:
+                ax.set_title(cable, fontsize=SUBFIG_TITLE_FONTSIZE)
             ax.set_xticks(x)
-            ax.set_xticklabels(clip_ids)
+            ax.set_xticklabels(clip_ids, fontsize=TICK_FONTSIZE)
 
             col_start += n_clips
 
@@ -575,20 +607,30 @@ def plot_avg_returns_per_cable_4rows(
                 capsize=3,
             )
 
-            ax.set_title(cable)
+            if row_index == 0:
+                ax.set_title(cable, fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
             ax.set_xticks(x)
-            ax.set_xticklabels(clip_ids)
+            show_clip_ids = [clip_ids[i][2:] for i in range(n_clips)]
+            ax.set_xticklabels(show_clip_ids, fontsize=TICK_FONTSIZE)
 
             col_start += n_clips
 
         return row_axes, row_yvals
 
-    def plot_row_bar_split(row_stats, row_index, properties):
-        """Stacked bars: each property as a layer, total shown via error bars."""
+    def plot_row_bar_split(row_stats, row_index, properties, color_random="#1f77b4", color_trained="#ff7f0e"):
+        """Stacked bars: each property as a layer, total shown via error bars.
+        Upper / lower parts are distinguished by hatch patterns.
+        """
         row_axes = []
         row_yvals = []
         col_start = 0
         properties = tuple(properties)
+        n_props = len(properties)
+
+        # hatch patterns for each stacked layer
+        # extend this list if you ever have >5 properties
+        hatch_patterns = ["///", "xxx", "...", "\\\\"]
+        hatch_patterns = hatch_patterns[:n_props]
 
         for cable in cable_ids:
             n_clips = clips_per_cable[cable]
@@ -615,8 +657,8 @@ def plot_avg_returns_per_cable_4rows(
                     std_r.append(np.nan)
                     means_t.append(np.nan)
                     std_t.append(np.nan)
-                    parts_r_list.append(np.full(len(properties), np.nan))
-                    parts_t_list.append(np.full(len(properties), np.nan))
+                    parts_r_list.append(np.full(n_props, np.nan))
+                    parts_t_list.append(np.full(n_props, np.nan))
                 else:
                     means_r.append(stats["mean_random"])
                     std_r.append(stats["std_random"])
@@ -629,7 +671,7 @@ def plot_avg_returns_per_cable_4rows(
             std_r   = np.array(std_r, dtype=float)
             means_t = np.array(means_t, dtype=float)
             std_t   = np.array(std_t, dtype=float)
-            parts_r = np.vstack(parts_r_list).T   # (n_props, n_clips)
+            parts_r = np.vstack(parts_r_list).T   # shape: (n_props, n_clips)
             parts_t = np.vstack(parts_t_list).T
 
             # collect row y values (total mean ± std)
@@ -649,18 +691,28 @@ def plot_avg_returns_per_cable_4rows(
             bottoms_r = np.zeros_like(x, dtype=float)
             bottoms_t = np.zeros_like(x, dtype=float)
 
-            for i in range(len(properties)):
+            for i in range(n_props):
+                hatch = hatch_patterns[i]
+
                 ax.bar(
                     x - bar_width / 2,
                     parts_r[i],
                     width=bar_width,
                     bottom=bottoms_r,
+                    color=_with_alpha(color_random, alpha=0.4),
+                    hatch=hatch,
+                    edgecolor=color_random,
+                    linewidth=2,
                 )
                 ax.bar(
                     x + bar_width / 2,
                     parts_t[i],
                     width=bar_width,
                     bottom=bottoms_t,
+                    color=_with_alpha(color_trained, alpha=0.4),
+                    hatch=hatch,
+                    edgecolor=color_trained,
+                    linewidth=2,
                 )
 
                 bottoms_r += parts_r[i]
@@ -684,37 +736,27 @@ def plot_avg_returns_per_cable_4rows(
                 ecolor="black",
             )
 
-            ax.set_title(cable)
+            if row_index == 0:
+                ax.set_title(cable, fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
             ax.set_xticks(x)
-            ax.set_xticklabels(clip_ids)
+            show_clip_ids = [clip_ids[i][2:] for i in range(n_clips)]
+            ax.set_xticklabels(show_clip_ids, fontsize=TICK_FONTSIZE)
 
             col_start += n_clips
 
         return row_axes, row_yvals
     
-    def plot_row_violin(row_stats, row_index):
+    def plot_row_violin(row_stats, row_index, 
+                        color_random="#1f77b4", 
+                        color_trained="#ff7f0e"):
         """
-        Plot a row of violin plots, one subplot per cable.
-
-        Expects:
-            - cable_ids              : list of cable IDs (outer scope)
-            - clips_per_cable        : dict[cable_id] -> int
-            - clip_ids_by_cable      : dict[cable_id] -> list[clip_id]
-            - fig, gs, bar_width     : from outer plotting function
-            - row_stats[cable][clip] = {
-                "random_values":  [...],
-                "trained_values": [...],
-            }
-
-        Returns:
-            row_axes : list of axes for this row
-            row_yvals: list of all y-values (for per-row y-limits)
+        Row of violin plots, with custom colors.
+        `color_random` and `color_trained` specify the violin fill colors.
         """
         row_axes = []
         row_yvals = []
         col_start = 0
 
-        # horizontal offset relative to clip index, similar to bars
         offset = bar_width * 0.4
         violin_width = bar_width * 0.7
 
@@ -726,78 +768,83 @@ def plot_avg_returns_per_cable_4rows(
             clip_ids = clip_ids_by_cable[cable]
             x = np.arange(n_clips)
 
-            ax = fig.add_subplot(gs[row_index, col_start:col_start + n_clips])
+            ax = fig.add_subplot(gs[row_index, col_start:col_start+n_clips])
             row_axes.append(ax)
 
-            # Collect datasets and positions for both policies
             random_datasets = []
             random_positions = []
             trained_datasets = []
             trained_positions = []
 
+            # Collect values
             for xi, clip in enumerate(clip_ids):
-                stats = row_stats.get(cable, {}).get(clip, None)
-                if stats is None:
+                stats = row_stats.get(cable, {}).get(clip)
+                if not stats:
                     continue
 
-                r_vals = np.asarray(stats.get("random_values", []), dtype=float)
-                t_vals = np.asarray(stats.get("trained_values", []), dtype=float)
+                rv = np.asarray(stats.get("random_values", []), dtype=float)
+                tv = np.asarray(stats.get("trained_values", []), dtype=float)
 
-                # Random violins
-                if r_vals.size > 0:
-                    random_datasets.append(r_vals)
+                if rv.size > 0:
+                    random_datasets.append(rv)
                     random_positions.append(xi - offset)
-                    row_yvals.extend(r_vals.tolist())
+                    row_yvals.extend(rv.tolist())
 
-                # Trained violins
-                if t_vals.size > 0:
-                    trained_datasets.append(t_vals)
+                if tv.size > 0:
+                    trained_datasets.append(tv)
                     trained_positions.append(xi + offset)
-                    row_yvals.extend(t_vals.tolist())
+                    row_yvals.extend(tv.tolist())
 
-            # Draw violins if we have any data
+            # Draw and color violins
             if random_datasets:
-                ax.violinplot(
+                parts_r = ax.violinplot(
                     random_datasets,
-                    positions=np.array(random_positions, dtype=float),
+                    positions=random_positions,
                     widths=violin_width,
-                    showmeans=True,       # <-- add
+                    showmeans=False,
                     showmedians=False,
                     showextrema=False,
                 )
+                for pc in parts_r['bodies']:
+                    pc.set_facecolor(color_random)
+                    # pc.set_edgecolor("black")
+                    pc.set_alpha(0.4)
 
             if trained_datasets:
-                ax.violinplot(
+                parts_t = ax.violinplot(
                     trained_datasets,
-                    positions=np.array(trained_positions, dtype=float),
+                    positions=trained_positions,
                     widths=violin_width,
-                    showmeans=True,
+                    showmeans=False,
                     showmedians=False,
                     showextrema=False,
                 )
+                for pc in parts_t['bodies']:
+                    pc.set_facecolor(color_trained)
+                    # pc.set_edgecolor("black")
+                    pc.set_alpha(0.4)
 
-            # --- Draw thick mean lines manually ---
-            # For random
+            # Add thick mean lines manually
             for vals, xpos in zip(random_datasets, random_positions):
-                mean_val = np.mean(vals)
-                # thicker bold line
-                ax.hlines(mean_val, xpos - violin_width*0.45, xpos + violin_width*0.45,
-                        color="black", linewidth=2.5, zorder=5)
+                ax.hlines(np.mean(vals), xpos - violin_width*0.45,
+                        xpos + violin_width*0.45,
+                        color=color_random, linewidth=2.5, zorder=5)
 
-            # For trained
             for vals, xpos in zip(trained_datasets, trained_positions):
-                mean_val = np.mean(vals)
-                ax.hlines(mean_val, xpos - violin_width*0.45, xpos + violin_width*0.45,
-                        color="black", linewidth=2.5, zorder=5)
+                ax.hlines(np.mean(vals), xpos - violin_width*0.45,
+                        xpos + violin_width*0.45,
+                        color=color_trained, linewidth=2.5, zorder=5)
 
-            # Cosmetics similar to your bar row
-            ax.set_title(cable)
+            if row_index == 0:
+                ax.set_title(cable, fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
             ax.set_xticks(x)
-            ax.set_xticklabels(clip_ids)
+            show_clip_ids = [clip_ids[i][2:] for i in range(n_clips)]
+            ax.set_xticklabels(show_clip_ids, fontsize=TICK_FONTSIZE)
 
             col_start += n_clips
 
         return row_axes, row_yvals
+
 
     # ---------- 4) Build each row ----------
     for row_index in range(n_rows):
@@ -827,7 +874,7 @@ def plot_avg_returns_per_cable_4rows(
         elif style == "split":
             row_axes, row_yvals = plot_row_bar_split(stats_row, row_index, props)
         elif style == "violin":
-            row_axes, row_yvals = plot_row_violin(row_raw_values, row_index)
+            row_axes, row_yvals = plot_row_violin(row_raw_values, row_index, color_random="#1f77b4", color_trained="#ff7f0e")
         else:
             raise ValueError(f"Unknown style '{style}', expected 'sum' or 'split'.")
 
@@ -858,28 +905,70 @@ def plot_avg_returns_per_cable_4rows(
         for j, ax in enumerate(row_axes):
             ax.set_yticks(ref_ticks)
             if j == 0:
-                ax.set_yticklabels(ref_ticklabels)
+                ax.set_yticklabels(ref_ticklabels, fontsize=TICK_FONTSIZE)
             else:
                 ax.set_yticklabels([])
 
-        ref_ax.set_ylabel(cfg.get("ylabel", row_configs[row_index].get("y_label", "Average score")))
+        ref_ax.set_ylabel(cfg.get("ylabel", row_configs[row_index].get("y_label", "Average score")), fontsize=SUBFIG_TITLE_FONTSIZE)
+        # move y-label further left
+        ref_ax.yaxis.set_label_coords(-0.4, 0.5)
 
         # X tick labels only on bottom row
         if row_index < n_rows - 1:
             for ax in row_axes:
                 ax.set_xticklabels([])
 
-    fig.suptitle(title)
-    fig.supylabel("Average score")
+    fig.suptitle(title, fontsize=FIG_TITLE_FONTSIZE)
+    # fig.supylabel("Average score")
 
-    # No legends for now (as requested)
+    # -------------------------------------------------------
+    # ONE ROW LEGEND AT THE BOTTOM
+    # -------------------------------------------------------
+    import matplotlib.patches as mpatches
+
+    # Policy patches (colors only)
+    patch_random  = mpatches.Patch(
+        facecolor=_with_alpha("#1f77b4", 0.4),
+        edgecolor="#1f77b4",
+        label="Random"
+    )
+    patch_trained = mpatches.Patch(
+        facecolor=_with_alpha("#ff7f0e", 0.4),
+        edgecolor="#ff7f0e",
+        label="Trained"
+    )
+
+    # Component patches (hatch only, neutral color)
+    patch_ciu = mpatches.Patch(
+        facecolor="white",
+        edgecolor="black",
+        hatch="///",
+        label=r"$c_{i,u}$"
+    )
+    patch_cit = mpatches.Patch(
+        facecolor="white",
+        edgecolor="black",
+        hatch="xxx",
+        label=r"$c_{i,t}$"
+    )
+
+    legend_handles = [patch_random, patch_trained, patch_ciu, patch_cit]
+
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=4,                  # one row
+        frameon=False,
+        bbox_to_anchor=(0.5, -0.02),
+        fontsize=LEGEND_FONTSIZE,
+    )
 
     fig.subplots_adjust(
         left=0.08,
         right=0.98,
         top=0.90,
         bottom=0.08,
-        hspace=0.5,
+        hspace=0.2,
         wspace=0.4,
     )
 

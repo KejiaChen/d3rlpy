@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
 import math
+from evaluate_plotting_new import *
 
 # def success_threshold(criterion, threshold):
 
@@ -32,19 +33,6 @@ ONLINE_SOURCES = {"ForceControl":["f_ext", "dx", "f_ext_sensor", "ff", "x"]}
 #                 "W_S_M_1_C_L_2": 11,
 #                 "W_S_M_1_C_S_2": 12,
 #                 "W_S_M_1_C_S_1": 13}
-
-plt.rcParams['font.family'] = 'Times New Roman'
-plt.rcParams['font.serif'] = ['Times New Roman']
-plt.rcParams['mathtext.fontset'] = 'custom'
-plt.rcParams['pdf.fonttype'] = 42
-plt.rcParams['ps.fonttype'] = 42
-
-FIG_TITLE_FONTSIZE = 24
-SUBFIG_TITLE_FONTSIZE = 22
-LABEL_FONTSIZE = 20
-LEGEND_FONTSIZE = 20
-TICK_FONTSIZE = 20
-LINEWIDTH = 2
 
 
 def normalize_obs(obs):
@@ -202,6 +190,7 @@ def compute_group_typed_statistics(base_dir, env_step=5):
                 "push_force_list": [],
                 "push_effort_list": [],
                 "push_energy_list": [],
+                "total_effort_list": [],
                 "deformation_list": [],
                 "duration_list": [],
             }
@@ -218,6 +207,8 @@ def compute_group_typed_statistics(base_dir, env_step=5):
         grouped_trajs[group_key]["stretch_energy_list"].append(utils_integral(obs[:terminal_index, 0], obs[:terminal_index, 1]))
         grouped_trajs[group_key]["push_force_list"].append(np.max((obs[:terminal_index, 3])))
         grouped_trajs[group_key]["push_effort_list"].append(np.sum((obs[:terminal_index, 3])) * dt)
+        total_effort = np.linalg.norm([obs[:, 0], obs[:, 3]], axis=0).sum() * dt
+        grouped_trajs[group_key]["total_effort_list"].append(total_effort)
         grouped_trajs[group_key]["push_energy_list"].append(utils_integral(obs[:terminal_index, 3], obs[:terminal_index, 4]))
         grouped_trajs[group_key]["deformation_list"].append(np.max((obs[:terminal_index, 4])))
         grouped_trajs[group_key]["duration_list"].append(terminal_index)
@@ -240,23 +231,45 @@ def compute_group_typed_statistics(base_dir, env_step=5):
 
         print(f"\033[92mComputed {len(grouped_refs[group_key]['dirs'])} reference values from demos of config type {group_key}: {ref_values}\033[0m")
 
-    return grouped_refs
+    return grouped_trajs, grouped_refs
 
 def load_and_evaluate_episodes(base_dir, criterion_fn=None, criterion_reference:dict=None, env_step=5, plot=True):
     # ep returns should have the same keys as criterion_reference
-    ep_returns = {key: {"return": [], "trials": []} for key in criterion_reference.keys()}
+    ep_returns = {key: 
+                  {"return": [],
+                "stretch_energy": [],
+                "push_energy": [],
+                "total_energy": [],
+                "total_effort": [],
+                "trials": [],} for key in criterion_reference.keys()}
 
     for traj_dir in sorted(os.listdir(base_dir)):
         traj_path = os.path.join(base_dir, traj_dir)
         if not os.path.isdir(traj_path):  # Skip files like "episode_dataset.npz"
             continue
-        group_key, obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_success, insertion_sign = load_and_evaluate_one_episode(traj_dir, traj_path, criterion_fn, criterion_reference, env_step, plot)
-        
+        group_key, obs_buffer, acts_buffer, ep_return_dict, terminals_buffer, fixing_success, insertion_sign = load_and_evaluate_one_episode(traj_dir, traj_path, criterion_fn, criterion_reference, env_step, plot)
+        # ep_return = ep_return_dict["stretch_energy"] + ep_return_dict["push_energy"] + ep_return_dict["total_effort"]
+        # ep_return = ep_return_dict["total_energy"] + ep_return_dict["stretch_effort"] + ep_return_dict["push_effort"]
+        ep_return = ep_return_dict["total_effort"] + ep_return_dict["total_energy"] 
+
         # if group_key is not in ep_returns, add it
         if group_key not in ep_returns:
-            ep_returns[group_key] = {"return": [], "trials": []}
-        
+            ep_returns[group_key] = {
+                "return": [],
+                "stretch_energy": [],
+                "push_energy": [],
+                "total_energy": [],
+                "total_effort": [],
+                "trials": [],
+                "cable_id": group_key[:7],
+                "clip_id": group_key[8:13],
+            }
+
         ep_returns[group_key]["return"].append(ep_return)
+        ep_returns[group_key]["stretch_energy"].append(ep_return_dict["stretch_energy"])
+        ep_returns[group_key]["push_energy"].append(ep_return_dict["push_energy"])
+        ep_returns[group_key]["total_energy"].append(ep_return_dict["total_energy"])
+        ep_returns[group_key]["total_effort"].append(ep_return_dict["total_effort"])
         ep_returns[group_key]["trials"].append(traj_dir)
         ep_returns[group_key]["cable_id"] = group_key[:7]
         ep_returns[group_key]["clip_id"] = group_key[8:13]
@@ -324,7 +337,7 @@ def load_and_evaluate_one_episode(traj_dir, traj_path, criterion_fn=None, criter
     print(f"Trajectory {traj_dir} has {obs_buffer.shape[0]} steps after trimming.")
 
     # load reference for this episode
-    ep_return = None
+    ep_return_dict = None
     if criterion_fn is not None and criterion_reference is not None:
         ep_ref_values = {"ref_stretch_force": 7.0, 
                         "ref_stretch_effort": 21.0, 
@@ -332,6 +345,7 @@ def load_and_evaluate_one_episode(traj_dir, traj_path, criterion_fn=None, criter
                         "ref_push_force": 7.0, 
                         "ref_push_effort": 7.0, 
                         "ref_push_energy": 0.1, 
+                        "ref_total_effort": 28.0,
                         "ref_deformation": 0.01, 
                         "ref_duration": 1000, 
                         "dt": 0.005}
@@ -346,9 +360,11 @@ def load_and_evaluate_one_episode(traj_dir, traj_path, criterion_fn=None, criter
                     ep_ref_values[ref_key] = group_ref["refs"][stats_key]["mean"]
             # calculate reward only BEFORE the terminal index
         
-            ep_return = criterion_fn(obs_buffer[:terminal_index], **ep_ref_values)
+            ep_return_dict = criterion_fn(obs_buffer[:terminal_index], **ep_ref_values)
             # save reward to a file
-            np.savetxt(os.path.join(traj_path, "return.txt"), np.array([ep_return ]), fmt='%.6f')
+            # np.savetxt(os.path.join(traj_path, "return.txt"), np.array([ep_return ]), fmt='%.6f')
+            json.dump(ep_return_dict, open(os.path.join(traj_path, "return.json"), 'w'), indent=4)
+            ep_return = ep_return_dict["stretch_energy"] + ep_return_dict["push_energy"] + ep_return_dict["total_effort"]
             print(f"\033[93mExpected return for trajectory {traj_dir}: {ep_return} with {obs_buffer.shape[0]} steps.\033[0m")
 
     # push or pull for insertion
@@ -359,7 +375,7 @@ def load_and_evaluate_one_episode(traj_dir, traj_path, criterion_fn=None, criter
     # plotting
     if plot:
         plot_force(obs_buffer, acts_buffer, traj_dir, traj_path, terminal_index, ending_index)
-    return group_key, obs_buffer, acts_buffer, ep_return, terminals_buffer, fixing_success, insertion_sign
+    return group_key, obs_buffer, acts_buffer, ep_return_dict, terminals_buffer, fixing_success, insertion_sign
 
 # def load_setup_label(parameters):
 #     # parameters = json.load(open(parameters_path, 'r'))
@@ -447,20 +463,20 @@ def plot_force(obs, act, traj_dir, traj_path, terminal_index, ending_index):
     plt.close(fig)
 
 
-def effort_and_energy_based_criterion_function(obs, include_deformation=True, ref_stretch_force=7.0, ref_stretch_effort=21.0, ref_stretch_energy=0.02, ref_push_force=7.0, ref_push_effort=7.0, ref_push_energy=0.1, ref_deformation=0.01, ref_duration=1000, dt=0.005):
+def effort_and_energy_based_criterion_function(obs, include_deformation=True, ref_stretch_force=7.0, ref_stretch_effort=21.0, ref_stretch_energy=0.02, ref_push_force=7.0, ref_push_effort=7.0, ref_push_energy=0.1, ref_deformation=0.01, ref_duration=1000, dt=0.005, ref_total_effort=28.0):
     # 1. Total force (integrated effort)
     stretch_effort = np.sum(obs[:, 0]) * dt
     push_effort = np.sum(obs[:, 3]) * dt
     stretch_energy = utils_integral(obs[:, 0], obs[:, 1]) # integral of f_s *delta_x_s
     push_energy = utils_integral(obs[:, 3], obs[:, 4])
-    total_energy = stretch_energy + push_energy
+    total_effort = np.linalg.norm([obs[:, 0], obs[:, 3]], axis=0).sum() * dt
 
     # 2. Max deformation and duration
     deformation = np.max(np.abs(obs[:, 4]))
     duration = obs.shape[0]
 
-    # 3. Scores
-    ref_total_energy = ref_stretch_energy + ref_push_energy
+    total_energy = stretch_energy + 3*push_energy
+    ref_total_energy = ref_stretch_energy + 3*ref_push_energy
 
     print(f"Stretch effort: {stretch_effort}, Push effort: {push_effort}, Total energy: {total_energy}")
 
@@ -468,6 +484,7 @@ def effort_and_energy_based_criterion_function(obs, include_deformation=True, re
     stretch_energy_score = 1.0 - (stretch_energy - ref_stretch_energy) / ref_stretch_energy
     push_effort_score    = 1.0 - (push_effort - ref_push_effort) / ref_push_effort
     push_energy_score    = 1.0 - (push_energy - ref_push_energy) / ref_push_energy
+    total_effort_score   = 1.0 - (total_effort - ref_total_effort) / ref_total_effort
     total_energy_score = 1.0 - (total_energy - ref_total_energy) / ref_total_energy
     # deform_score  = 1.0 - (deformation - ref_deformation) / ref_deformation
     # time_score    = 1.0 - (duration - ref_duration) / ref_duration
@@ -479,17 +496,23 @@ def effort_and_energy_based_criterion_function(obs, include_deformation=True, re
     # time_score = np.clip(time_score, 0.0, 1.0)
 
     # 5. Final return
-    if include_deformation:
-        ep_return = 15 * np.max(stretch_effort_score, 0) + 15 * np.max(push_effort_score, 0) + 10 * np.max(total_energy_score, 0)
-    else:
-        ep_return = 20 * np.max(stretch_effort_score, 0) + 20 * np.max(push_effort_score, 0)
+    ep_return = {
+        "total_energy": 10*total_energy_score,
+        "stretch_energy": 10*stretch_energy_score,
+        "push_energy": 10*push_energy_score,
+        "total_effort": 15*total_effort_score,
+        "stretch_effort": 15*stretch_effort_score,
+        "push_effort": 15*push_effort_score
+    }
 
-    if ep_return < 0:
-        ep_return = 0.0
+    print("ref total energy:", ref_total_energy, " total energy:", total_energy, " total energy score:", total_energy_score)
+
+    # ep_return = 15 * np.max(stretch_effort_score, 0) + 15 * np.max(push_effort_score, 0) + 10 * np.max(total_energy_score, 0)
+
     return ep_return
 
 
-def effort_and_energy_based_exponential_criterion_function(obs, include_deformation=True, ref_stretch_force=7.0, ref_stretch_effort=21.0, ref_stretch_energy=0.02, ref_push_force=7.0, ref_push_effort=7.0, ref_push_energy=0.1, ref_deformation=0.01, ref_duration=1000, dt=0.005):
+def effort_and_energy_based_exponential_criterion_function(obs, include_deformation=True, ref_stretch_force=7.0, ref_stretch_effort=21.0, ref_stretch_energy=0.02, ref_push_force=7.0, ref_push_effort=7.0, ref_push_energy=0.1, ref_deformation=0.01, ref_duration=1000, dt=0.005, ref_total_effort=28.0):
     stretch_force = obs[:, 0]
     stretch_displacement = obs[:, 1]
     stretch_velocity = obs[:, 2]
@@ -503,6 +526,7 @@ def effort_and_energy_based_exponential_criterion_function(obs, include_deformat
     stretch_energy = utils_integral(obs[:, 0], obs[:, 1])
     push_energy = utils_integral(obs[:, 3], obs[:, 4])
     total_energy = stretch_energy + push_energy
+    total_effort = np.linalg.norm([obs[:, 0], obs[:, 3]], axis=0).sum() * dt
 
     # 2. Deformation and duration
     deformation = np.max(obs[:, 4])
@@ -512,7 +536,10 @@ def effort_and_energy_based_exponential_criterion_function(obs, include_deformat
 
     # 3. Exponential scores (bounded in (0,1])
     stretch_effort_score = np.exp(-(stretch_effort / ref_stretch_effort))
+    stretch_energy_score = np.exp(-(stretch_energy / ref_stretch_energy))
     push_effort_score    = np.exp(-(push_effort / ref_push_effort))
+    push_energy_score    = np.exp(-(push_energy / ref_push_energy))
+    total_effort_score   = np.exp(-(total_effort / ref_total_effort))
     total_energy_score   = np.exp(-(total_energy / (ref_stretch_energy + ref_push_energy)))
 
     # Optional scores if you want them later
@@ -522,20 +549,18 @@ def effort_and_energy_based_exponential_criterion_function(obs, include_deformat
     # time_score           = np.exp(-(duration / ref_duration))
 
     # 4. Weighted final return (bounded above)
-    if include_deformation:
-        ep_return = (
-            30 * stretch_effort_score +
-            30 * push_effort_score +
-            20 * total_energy_score
-        )
-    else:
-        ep_return = (
-            40 * stretch_effort_score +
-            40 * push_effort_score
-        )
+    ep_return = {
+        "total_energy": 10*total_energy_score,
+        "stretch_energy": 10*stretch_energy_score,
+        "push_energy": 10*push_energy_score,
+        "total_effort": 15*total_effort_score,
+        "stretch_effort": 15*stretch_effort_score,
+        "push_effort": 15*push_effort_score
+    }
+
 
     # Since all scores are > 0, ep_return never goes negative
-    return float(ep_return)
+    return ep_return
 
 def plot_group_returns_subplots(
     random_returns,
@@ -695,264 +720,12 @@ def export_returns_to_csv(filename, random_returns, trained_returns):
 
     print(f"Saved to {filename}")
 
-def plot_avg_returns_per_cable_same_bar_width(
-    random_returns,
-    trained_returns,
-    labels=("Random", "Trained"),
-    title="Average returns per clip for each cable",
-):
-    """
-    One 2D bar subplot per cable_id (average over trials per clip_id).
 
-    - X axis: clip_id
-    - Bars: random vs trained
-    - Error bars: standard deviation across trials
-    - Exactly 2 rows of subplots.
-    - Subplot width is proportional to number of clips.
-    - Bars have the same visual width across ALL subplots
-      (achieved by a single 2xN GridSpec of uniform 'clip slots').
-
-    With:
-    - Extra horizontal gaps between subfigures in a row
-    - Wider overall figure and more left/right margin
-    - SAME y-axis (limits + ticks) for all subplots
-      (only leftmost subplot in each row shows y tick labels)
-    """
-
-    # 1) Aggregate raw data: (cable_id, clip_id) -> list of returns for each policy
-    agg = defaultdict(lambda: {"random": [], "trained": []})
-
-    # Random
-    for _, data in random_returns.items():
-        cable_id = data.get("cable_id")
-        clip_id = data.get("clip_id")
-        if cable_id is None or clip_id is None:
-            continue
-        for r in data.get("return", []):
-            agg[(cable_id, clip_id)]["random"].append(float(r))
-
-    # Trained
-    for _, data in trained_returns.items():
-        cable_id = data.get("cable_id")
-        clip_id = data.get("clip_id")
-        if cable_id is None or clip_id is None:
-            continue
-        for r in data.get("return", []):
-            agg[(cable_id, clip_id)]["trained"].append(float(r))
-
-    # 2) Per-cable structure:
-    # cable_id -> clip_id -> dict(mean/std for random & trained)
-    cable_to_clips = defaultdict(dict)
-    for (cable_id, clip_id), d in agg.items():
-        r_vals = d["random"]
-        t_vals = d["trained"]
-
-        if r_vals:
-            mean_r = np.mean(r_vals)
-            std_r = np.std(r_vals, ddof=0)  # ddof=0 so 1 sample => std=0
-        else:
-            mean_r, std_r = np.nan, np.nan
-
-        if t_vals:
-            mean_t = np.mean(t_vals)
-            std_t = np.std(t_vals, ddof=0)
-        else:
-            mean_t, std_t = np.nan, np.nan
-
-        cable_to_clips[cable_id][clip_id] = {
-            "mean_random": mean_r,
-            "std_random": std_r,
-            "mean_trained": mean_t,
-            "std_trained": std_t,
-        }
-
-    if not cable_to_clips:
-        print("No (cable_id, clip_id) data found.")
-        return
-
-    # 3) Layout: 2 rows, width proportional to #clips
-    cable_ids = sorted(cable_to_clips.keys())
-    n_cables = len(cable_ids)
-
-    split_idx = math.ceil(n_cables / 2)
-    row0_cables = cable_ids[:split_idx]
-    row1_cables = cable_ids[split_idx:]
-
-    clips_per_cable = {cid: len(cable_to_clips[cid]) for cid in cable_ids}
-
-    # number of empty "gap slots" between subfigures in a row
-    # we don't use empty grid columns as gaps anymore
-    gap_slots = 0
-
-    def row_slots(cables_row):
-        if not cables_row:
-            return 1
-        # sum of clip slots + gaps between subfigures
-        return sum(clips_per_cable[cid] for cid in cables_row) + gap_slots * (len(cables_row) - 1)
-
-    total_clips_row0 = row_slots(row0_cables)
-    total_clips_row1 = row_slots(row1_cables)
-
-    total_slots = max(total_clips_row0, total_clips_row1)
-
-    # Wider figure: more horizontal room overall
-    fig = plt.figure(figsize=(0.9 * total_slots + 7, 9))
-    gs = fig.add_gridspec(2, total_slots, width_ratios=[1] * total_slots)
-
-    bar_width = 0.35
-    axes_row0 = []
-    axes_row1 = []
-
-    # We'll collect all values (means ± std) to compute a global y-range
-    all_y_vals = []
-
-    def plot_row(cable_ids_row, row_index):
-        """Place each cable in this row, spanning slots equal to its #clips, with gaps."""
-        nonlocal all_y_vals
-        row_axes = []
-        col_start = 0
-
-        for idx, cable_id in enumerate(cable_ids_row):
-            n_clips = clips_per_cable[cable_id]
-            if n_clips == 0:
-                continue
-
-            col_end = col_start + n_clips
-            ax = fig.add_subplot(gs[row_index, col_start:col_end])
-            row_axes.append(ax)
-
-            clip_dict = cable_to_clips[cable_id]
-            clip_ids = sorted(clip_dict.keys())
-            x = np.arange(n_clips)
-
-            means_random = []
-            std_random = []
-            means_trained = []
-            std_trained = []
-
-            for clip_id in clip_ids:
-                stats = clip_dict[clip_id]
-                means_random.append(stats["mean_random"])
-                std_random.append(stats["std_random"])
-                means_trained.append(stats["mean_trained"])
-                std_trained.append(stats["std_trained"])
-
-            means_random = np.array(means_random, dtype=float)
-            std_random = np.array(std_random, dtype=float)
-            means_trained = np.array(means_trained, dtype=float)
-            std_trained = np.array(std_trained, dtype=float)
-
-            # collect values for global y-limits (mean ± std)
-            for m, s in zip(means_random, std_random):
-                if not np.isnan(m):
-                    all_y_vals.append(m)
-                    if not np.isnan(s):
-                        all_y_vals.append(m + s)
-                        all_y_vals.append(m - s)
-            for m, s in zip(means_trained, std_trained):
-                if not np.isnan(m):
-                    all_y_vals.append(m)
-                    if not np.isnan(s):
-                        all_y_vals.append(m + s)
-                        all_y_vals.append(m - s)
-
-            # Bars + error bars
-            ax.bar(
-                x - bar_width / 2,
-                means_random,
-                width=bar_width,
-                yerr=std_random,
-                fmt="none",
-                capsize=3,
-                label=labels[0],
-            )
-            ax.bar(
-                x + bar_width / 2,
-                means_trained,
-                width=bar_width,
-                yerr=std_trained,
-                capsize=3,
-                label=labels[1],
-            )
-
-            ax.set_title(f"{cable_id}", fontsize=SUBFIG_TITLE_FONTSIZE)
-            ax.set_xticks(x)
-            ax.set_xticklabels(clip_ids, rotation=0, ha="center", fontsize=TICK_FONTSIZE)
-            ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
-
-            # move start to end + gap_slots
-            col_start = col_end + gap_slots
-
-        return row_axes
-
-    axes_row0 = plot_row(row0_cables, 0)
-    axes_row1 = plot_row(row1_cables, 1)
-    axes = axes_row0 + axes_row1
-
-    # ------------- GLOBAL Y AXIS FOR ALL SUBPLOTS --------------------
-    if all_y_vals and axes:
-        global_max = max(all_y_vals)
-        if global_max <= 0:
-            global_max = 1.0
-
-        # Global y limits: always start at zero for bar charts
-        ylim = (0, global_max * 1.05)
-
-        # Apply the same limits to all axes
-        for ax in axes:
-            ax.set_ylim(ylim)
-
-        # Force draw so ticks are computed
-        fig.canvas.draw()
-
-        # Take ticks from the first axis as global ticks
-        ref_ax = axes[0]
-        ref_ticks = ref_ax.get_yticks()
-        ref_ticklabels = [lab.get_text() for lab in ref_ax.get_yticklabels()]
-
-        # Apply same ticks everywhere
-        for ax in axes:
-            ax.set_yticks(ref_ticks)
-            ax.set_yticklabels(ref_ticklabels, fontsize=TICK_FONTSIZE)
-
-        # Only leftmost subplot in each row shows labels
-        if len(axes_row0) > 1:
-            for ax in axes_row0[1:]:
-                ax.set_yticklabels([])
-
-        if len(axes_row1) > 1:
-            for ax in axes_row1[1:]:
-                ax.set_yticklabels([])
-
-
-    fig.supylabel("Average return", fontsize=FIG_TITLE_FONTSIZE)
-    fig.suptitle(title, y=0.95, fontsize=FIG_TITLE_FONTSIZE)
-
-    # Global legend with more right margin
-    fig.legend(
-        labels,
-        loc="center right",
-        bbox_to_anchor=(0.99, 0.3),
-        frameon=False,
-        fontsize=LEGEND_FONTSIZE,
-    )
-
-    # Layout: keep margins for ylabel and legend, and add vertical spacing
-    fig.subplots_adjust(
-        left=0.06,   # room for y-label
-        right=0.95,  # space on the right for legend
-        top=0.85,
-        bottom=0.08,
-        hspace=0.3,
-        wspace=0.3,
-    )
-
-    plt.show()
 
 
 if __name__ == "__main__":
     random_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/evaluation_random"
-    random_ref_values = compute_group_typed_statistics(random_dir, env_step=5)
+    random_raw_values, random_ref_values = compute_group_typed_statistics(random_dir, env_step=5)
     with open(os.path.join(random_dir, "criterions.json"), 'w') as f:
         json.dump(random_ref_values, f, indent=4)
 
@@ -965,7 +738,7 @@ if __name__ == "__main__":
     # random_exp_returns = {k: v for k, v in random_exp_returns.items() if "pose_7" in k}
 
     trained_with_encoder_dir = "/home/tp2/Documents/kejia/clip_fixing_dataset/evaluation_trained_with_encoder"
-    trained_ref_values = compute_group_typed_statistics(trained_with_encoder_dir, env_step=5)
+    trained_raw_values, trained_ref_values = compute_group_typed_statistics(trained_with_encoder_dir, env_step=5)
     with open(os.path.join(trained_with_encoder_dir, "criterions.json"), 'w') as f:
         json.dump(trained_ref_values, f, indent=4)
     trained_normal_returns = load_and_evaluate_episodes(trained_with_encoder_dir, effort_and_energy_based_criterion_function, random_ref_values, env_step=5, plot=False)
@@ -986,11 +759,126 @@ if __name__ == "__main__":
 
     # export_returns_to_csv(os.path.join(trained_with_encoder_dir, "fixing_returns.csv"), random_normal_returns, trained_normal_returns)
 
-    plot_avg_returns_per_cable_same_bar_width(
+    row_configs = [
+        {
+            "random_returns": random_normal_returns,
+            "trained_returns": trained_normal_returns,
+            "properties": ("total_energy", "total_effort"),
+            "y_label": r"$c_i$",
+            "style": "split",
+        },
+        {
+            "random_returns": random_raw_values,
+            "trained_returns": trained_raw_values,
+            "properties": ("stretch_energy_list",),
+            "y_label": r"$U_{l}^{s}$",
+            "style": "violin",
+        },
+        {
+            "random_returns": random_raw_values,
+            "trained_returns": trained_raw_values,
+            "properties": ("push_energy_list",),
+            "y_label": r"$U_{l}^{b}$",
+            "style": "violin",
+        },
+        {
+            "random_returns": random_raw_values,
+            "trained_returns": trained_raw_values,
+            "properties": ("duration_list",),
+            "y_label": r"$T$",
+            "style": "violin",
+        },
+    ]
+
+    plot_avg_returns_per_cable_4rows(
+        labels=("Random", "Trained"),
+        row_configs=row_configs,
+        title="Comparison of Policies over DLOs and Fixtures",
+        save_path=os.path.join(trained_with_encoder_dir, "avg_scores_per_cable.png")
+    )
+
+    plot_avg_returns_per_cable(
         random_returns=random_normal_returns,
         trained_returns=trained_normal_returns,
         labels=("Random", "Trained"),
-        title="Average Scores per Clip for Each DLO",
+        properties=("total_energy", "total_effort"),
+        title="Average scores of each DLO and clip",
+        save_path=os.path.join(trained_with_encoder_dir, "avg_scores_per_cable.png"),
+        style="split",
     )
+
+    plot_avg_returns_per_cable(
+        random_returns=random_raw_values,
+        trained_returns=trained_raw_values,
+        labels=("Random", "Trained"),
+        properties=("stretch_energy_list", ),
+        title="Average stretch energies of each DLO and clip",
+        save_path=os.path.join(trained_with_encoder_dir, "avg_stretch_energy_per_cable.png")
+    )
+
+
+    # plot_avg_returns_per_cable_bar_split(
+    #     random_returns=random_normal_returns,
+    #     trained_returns=trained_normal_returns,
+    #     labels=("Random", "Trained"),
+    #     properties=("total_energy", "total_effort"),
+    #     title="Average scores of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_scores_per_cable.png")
+    # )
+
+    # plot_avg_returns_per_cable_bar(
+    #     random_returns=random_raw_values,
+    #     trained_returns=trained_raw_values,
+    #     labels=("Random", "Trained"),
+    #     properties=("stretch_energy_list", ),
+    #     title="Average stretch energies of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_stretch_energy_per_cable.png")
+    # )
+
+    # plot_avg_returns_per_cable_bar(
+    #     random_returns=random_raw_values,
+    #     trained_returns=trained_raw_values,
+    #     labels=("Random", "Trained"),
+    #     properties=("push_energy_list", ),
+    #     title="Average push energies of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_push_energy_per_cable.png")
+    # )
+
+    # plot_avg_returns_per_cable_bar(
+    #     random_returns=random_raw_values,
+    #     trained_returns=trained_raw_values,
+    #     labels=("Random", "Trained"),
+    #     properties=("total_effort_list", ),
+    #     title="Average efforts of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_total_effort_per_cable.png")
+    # )
+
+    # plot_avg_returns_per_cable_bar(
+    #     random_returns=random_raw_values,
+    #     trained_returns=trained_raw_values,
+    #     labels=("Random", "Trained"),
+    #     properties=("push_force_list", ),
+    #     title="Average push forces of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_push_force_per_cable.png")
+    # )
+
+    # plot_avg_returns_per_cable_bar(
+    #     random_returns=random_raw_values,
+    #     trained_returns=trained_raw_values,
+    #     labels=("Random", "Trained"),
+    #     properties=("stretch_force_list", ),
+    #     title="Average stretch forces of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_stretch_force_per_cable.png")
+    # )
+
+    # plot_avg_returns_per_cable_bar(
+    #     random_returns=random_raw_values,
+    #     trained_returns=trained_raw_values,
+    #     labels=("Random", "Trained"),
+    #     properties=("deformation_list", ),
+    #     title="Average deformations of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_deformation_per_cable.png")
+    # )
+    
 
     print("Plotted average scores per cable.")
