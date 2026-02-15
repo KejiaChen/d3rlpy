@@ -6,18 +6,18 @@ import os
 from evaluate_policy import load_and_evaluate_one_episode, effort_and_energy_based_criterion_function
 import matplotlib as mpl
 
-mpl.rcParams['font.family'] = 'Times New Roman'
-mpl.rcParams['font.serif'] = ['Times New Roman']
-mpl.rcParams['mathtext.fontset'] = 'custom'
-mpl.rcParams['mathtext.rm'] = 'Times New Roman'
-mpl.rcParams['mathtext.it'] = 'Times New Roman:italic'
-mpl.rcParams['mathtext.bf'] = 'Times New Roman:bold'
+mpl.rcParams.update({
+    "font.family": "Times New Roman",
 
-mpl.rcParams['pdf.fonttype'] = 42  
-mpl.rcParams['ps.fonttype'] = 42
+    "axes.labelsize": 22,
+    "axes.titlesize": 24,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "legend.fontsize": 22,
+})
 
 FIG_TITLE_FONTSIZE = 28
-SUBFIG_TITLE_FONTSIZE = 22
+SUBFIG_TITLE_FONTSIZE = 26
 LABEL_FONTSIZE = 20
 LEGEND_FONTSIZE = 18
 TICK_FONTSIZE = 18
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         labels,
         loc="lower center",
         ncol=len(labels),
-        fontsize=LEGEND_FONTSIZE,
+        # fontsize=LEGEND_FONTSIZE,
         frameon=False,
         bbox_to_anchor=(0.5, 0.005)  # ✅ legend 在图内底部，不会把图挤乱
     )
