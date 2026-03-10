@@ -7,7 +7,10 @@ from evaluate_policy import load_and_evaluate_one_episode, effort_and_energy_bas
 import matplotlib as mpl
 
 mpl.rcParams.update({
-    "font.family": "Times New Roman",
+    "font.family": "Helvetica",
+    "font.sans-serif": ["Helvetica"],
+    "pdf.use14corefonts": True,
+    "ps.useafm": True,
 
     "axes.labelsize": 22,
     "axes.titlesize": 24,
@@ -16,25 +19,25 @@ mpl.rcParams.update({
     "legend.fontsize": 22,
 })
 
-FIG_TITLE_FONTSIZE = 28
-SUBFIG_TITLE_FONTSIZE = 26
-LABEL_FONTSIZE = 20
-LEGEND_FONTSIZE = 18
-TICK_FONTSIZE = 18
+FIG_TITLE_FONTSIZE = 24
+SUBFIG_TITLE_FONTSIZE = 22
+LABEL_FONTSIZE = 22
+LEGEND_FONTSIZE = 20
+TICK_FONTSIZE = 20
 LINEWIDTH = 3
 
 def plot_deformation(ax, title, obs, terminal_index):
     time = np.arange(obs.shape[0])
     # Plot deformation curves
-    ax.plot(time, obs[:, 1], label='Stretch Deformation', color="#5db847", linewidth=LINEWIDTH, alpha=0.6)
-    ax.plot(time, obs[:, 4], label='Push Deformation', color="#ee7c8b", linewidth=LINEWIDTH, alpha=0.6)
+    ax.plot(time, obs[:, 1], label='Stretch Deformation', color="#5db847", linewidth=LINEWIDTH, alpha=0.8)
+    ax.plot(time, obs[:, 4], label='Push Deformation', color="#ee7c8b", linewidth=LINEWIDTH, alpha=0.8)
 
     # Vertical marker
     ax.axvline(x=terminal_index, color='black', linestyle='-.', label='Finish', linewidth=1)
 
     # Labels / formatting
     ax.set_xlabel('Time (ms)', fontsize=LABEL_FONTSIZE)
-    ax.set_ylabel('Deformation (m)', fontsize=LABEL_FONTSIZE)
+    ax.set_ylabel('Deform (m)', fontsize=LABEL_FONTSIZE)
     ax.tick_params(axis='both', which='major', labelsize=TICK_FONTSIZE)
     # ax.set_title(title)
     # ax.legend()
@@ -45,8 +48,8 @@ def plot_force(ax, title, obs, act, terminal_index):
     # Plot force curves
     ax.plot(time[:terminal_index], act[:terminal_index, 0], label='FF Stretch', color='#5db847', linestyle='--', linewidth=LINEWIDTH)
     ax.plot(time[:terminal_index], act[:terminal_index, 1], label='FF Push', color="#ee7c8b", linestyle='--', linewidth=LINEWIDTH)
-    ax.plot(time, obs[:, 0], label='Ext Stretch', color='#5db847', linewidth=LINEWIDTH, alpha=0.6)
-    ax.plot(time, obs[:, 3], label='Ext Push', color="#ee7c8b", linewidth=LINEWIDTH, alpha=0.6)
+    ax.plot(time, obs[:, 0], label='Ext Stretch', color='#5db847', linewidth=LINEWIDTH, alpha=0.8)
+    ax.plot(time, obs[:, 3], label='Ext Push', color="#ee7c8b", linewidth=LINEWIDTH, alpha=0.8)
 
     # Vertical marker
     ax.axvline(x=terminal_index, color='black', linestyle='-.', label='Finish', linewidth=1)
@@ -82,9 +85,13 @@ if __name__ == "__main__":
     # Trial A: trained 3704, random 1272
     # Trial B: trained 3686, random 3916
     # ------------------------
+    DLO_2 = "BMM"
+    CLIP_2 = "CL-2"
     trained_obs_A, trained_acts_A, trained_terminal_A, trained_range_A = load_episode(trained_base_dir, "3697")
     random_obs_A,  random_acts_A,  random_terminal_A,  random_range_A  = load_episode(random_base_dir,  "3823")
-
+        
+    DLO_1 = "BLL"
+    CLIP_1 = "CL-2"
     trained_obs_B, trained_acts_B, trained_terminal_B, trained_range_B = load_episode(trained_base_dir, "3686")
     random_obs_B,  random_acts_B,  random_terminal_B,  random_range_B  = load_episode(random_base_dir,  "3916")
 
@@ -150,23 +157,27 @@ if __name__ == "__main__":
         p1 = ax01.get_position()
         x_center = (p0.x0 + p1.x1) / 2
         y_top = max(p0.y1, p1.y1) + 0.08
-        fig.text(x_center, y_top, trial_title, ha="center", va="bottom", fontsize=SUBFIG_TITLE_FONTSIZE)
+        fig.text(x_center, y_top, trial_title, ha="center", va="bottom", fontsize=FIG_TITLE_FONTSIZE )
 
-        return ax10  # 返回一个带 legend 的轴（用来抽 handles/labels）
+        return ax10, (ax00, ax10)  # 返回 legend 轴和保留 y label 的左列轴
 
-    ax_for_legend_A = draw_one_trial(
+    ax_for_legend_A, left_axes_A = draw_one_trial(
         outer[0],
         random_obs_A, random_acts_A, random_terminal_A, random_range_A,
         trained_obs_A, trained_acts_A, trained_terminal_A, trained_range_A,
-        trial_title="Fixing BMM into CL-2"
+        trial_title=f"Fixing {DLO_1} into {CLIP_1}"
     )
 
-    draw_one_trial(
+    _, left_axes_B = draw_one_trial(
         outer[1],
         random_obs_B, random_acts_B, random_terminal_B, random_range_B,
         trained_obs_B, trained_acts_B, trained_terminal_B, trained_range_B,
-        trial_title="Fixing BLL into CL-2"
+        trial_title=f"Fixing {DLO_2} into {CLIP_2}"
     )
+
+    # Align the visible y labels across the nested grids without overriding their padding.
+    left_axes = [*left_axes_A, *left_axes_B]
+    fig.align_ylabels(left_axes)
 
     # ------------------------
     # One shared legend at the bottom (only share legend)
@@ -182,7 +193,7 @@ if __name__ == "__main__":
         bbox_to_anchor=(0.5, 0.005)  # ✅ legend 在图内底部，不会把图挤乱
     )
 
-    plt.savefig(os.path.join(trained_base_dir, "example_plot_two_trials.pdf"))
+    plt.savefig(os.path.join(trained_base_dir, f"example_plot_{DLO_1}_{CLIP_1}_and_{DLO_2}_{CLIP_2}.pdf"))
     plt.show()
 
     print("done")

@@ -4,20 +4,22 @@ import matplotlib.pyplot as plt
 import math
 
 import matplotlib as mpl
+from matplotlib.ticker import MaxNLocator
 
-mpl.rcParams['font.family'] = 'Times New Roman'
-mpl.rcParams['font.serif'] = ['Times New Roman']
+mpl.rcParams['font.family'] = 'Helvetica'
+mpl.rcParams['font.sans-serif'] = ['Helvetica']
 mpl.rcParams['mathtext.fontset'] = 'custom'
-mpl.rcParams['mathtext.rm'] = 'Times New Roman'
-mpl.rcParams['mathtext.it'] = 'Times New Roman:italic'
-mpl.rcParams['mathtext.bf'] = 'Times New Roman:bold'
+mpl.rcParams['mathtext.rm'] = 'Helvetica'
+mpl.rcParams['mathtext.it'] = 'Helvetica:italic'
+mpl.rcParams['mathtext.bf'] = 'Helvetica:bold'
 
-mpl.rcParams['pdf.fonttype'] = 42  
-mpl.rcParams['ps.fonttype'] = 42
+mpl.rcParams['pdf.use14corefonts'] = True
+mpl.rcParams['ps.useafm'] = True
+mpl.rcParams['axes.unicode_minus'] = False
 
-FIG_TITLE_FONTSIZE = 28
+FIG_TITLE_FONTSIZE = 32
 SUBFIG_TITLE_FONTSIZE = 26
-LABEL_FONTSIZE = 20
+LABEL_FONTSIZE = 24
 LEGEND_FONTSIZE = 24
 TICK_FONTSIZE = 26
 LINEWIDTH = 2
@@ -150,6 +152,22 @@ def _with_alpha(color, alpha=0.4):
     rgba = mcolors.to_rgba(color)
     return (rgba[0], rgba[1], rgba[2], alpha)
 
+def nice_step(ymax, n_ticks=4):
+    raw_step = ymax / (n_ticks - 1)
+
+    exp = np.floor(np.log10(raw_step))
+    base = raw_step / 10**exp
+
+    if base < 1.5:
+        nice_base = 1
+    elif base < 3:
+        nice_base = 2
+    elif base < 7:
+        nice_base = 3
+    else:
+        nice_base = 10
+
+    return nice_base * 10**exp
 
 
 # ================================
@@ -608,9 +626,18 @@ def plot_avg_returns_per_cable_4rows(
             )
 
             if row_index == 0:
-                ax.set_title(cable, fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
+                ax.set_title(cable[:5].replace("_", ""), fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
             ax.set_xticks(x)
-            show_clip_ids = [clip_ids[i][2:] for i in range(n_clips)]
+            show_clip_ids = []
+            for cid in clip_ids:
+                # expect something like "C_L_1"
+                parts = cid.split("_")
+                if len(parts) == 3 and parts[0] == "C":
+                    # "C_L_1" -> "CL-1"
+                    show_clip_ids.append(parts[0] + parts[1] + "-" + parts[2])
+                else:
+                    # fallback: just show original
+                    show_clip_ids.append(cid)
             ax.set_xticklabels(show_clip_ids, fontsize=TICK_FONTSIZE)
 
             col_start += n_clips
@@ -737,9 +764,18 @@ def plot_avg_returns_per_cable_4rows(
             )
 
             if row_index == 0:
-                ax.set_title(cable, fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
+                ax.set_title(cable[:5].replace("_", ""), fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
             ax.set_xticks(x)
-            show_clip_ids = [clip_ids[i][2:] for i in range(n_clips)]
+            show_clip_ids = []
+            for cid in clip_ids:
+                # expect something like "C_L_1"
+                parts = cid.split("_")
+                if len(parts) == 3 and parts[0] == "C":
+                    # "C_L_1" -> "CL-1"
+                    show_clip_ids.append(parts[0] + parts[1] + "-" + parts[2])
+                else:
+                    # fallback: just show original
+                    show_clip_ids.append(cid)
             ax.set_xticklabels(show_clip_ids, fontsize=TICK_FONTSIZE)
 
             col_start += n_clips
@@ -836,9 +872,18 @@ def plot_avg_returns_per_cable_4rows(
                         color=color_trained, linewidth=2.5, zorder=5)
 
             if row_index == 0:
-                ax.set_title(cable, fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
+                ax.set_title(cable[:5].replace("_", ""), fontsize=SUBFIG_TITLE_FONTSIZE, y=1.05)
             ax.set_xticks(x)
-            show_clip_ids = [clip_ids[i][2:] for i in range(n_clips)]
+            show_clip_ids = []
+            for cid in clip_ids:
+                # expect something like "C_L_1"
+                parts = cid.split("_")
+                if len(parts) == 3 and parts[0] == "C":
+                    # "C_L_1" -> "CL-1"
+                    show_clip_ids.append(parts[0] + parts[1] + "-" + parts[2])
+                else:
+                    # fallback: just show original
+                    show_clip_ids.append(cid)
             ax.set_xticklabels(show_clip_ids, fontsize=TICK_FONTSIZE)
 
             col_start += n_clips
@@ -891,25 +936,48 @@ def plot_avg_returns_per_cable_4rows(
         # Per-row y limits
         if row_yvals:
             ymax = max(row_yvals)
-            if ymax <= 0:
+            if ymax <= 0 or not np.isfinite(ymax):
                 ymax = 1.0
             ymax *= 1.05
-            for ax in row_axes:
-                ax.set_ylim(0, ymax)
 
-        # Per-row y ticks (left axis only)
+            ymin = min(row_yvals)
+            if ymin >= 0 or not np.isfinite(ymin):
+                ymin = 0.0
+            ymin *= 1.05
+        else:
+            ymax = 1.0
+            ymin = 0.0
+
+        for ax in row_axes:
+            ax.set_ylim(ymin, ymax)
+
+        # Per-row y ticks (left axis only) using nice steps
         ref_ax = row_axes[0]
-        ref_ticks = ref_ax.get_yticks()
-        ref_ticklabels = [t.get_text() for t in ref_ax.get_yticklabels()]
+
+        step = nice_step(ymax-ymin, n_ticks=row_configs[row_index]["n_ticks"])        # 你想更少就 n_ticks=3，更密就 5
+        ymax_nice = np.ceil(ymax / step) * step  # 把上限对齐到整步长
+        ymin_nice = np.floor(ymin / step) * step
+        ticks = np.arange(ymin_nice, min(ymax_nice + 0.5 * step, 10000), step)
+
+        # 可选：如果 ticks 太多（比如>5），强制稀疏一点
+        if len(ticks) > 5:
+            step = nice_step(ymax-ymin, n_ticks=3)
+            ymax_nice = np.ceil(ymax / step) * step
+            ymin_nice = np.floor(ymin / step) * step
+            ticks = np.arange(ymin_nice, min(ymax_nice + 0.5 * step, 10000), step)
 
         for j, ax in enumerate(row_axes):
-            ax.set_yticks(ref_ticks)
+            ax.set_yticks(ticks)
             if j == 0:
-                ax.set_yticklabels(ref_ticklabels, fontsize=TICK_FONTSIZE)
+                ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
             else:
                 ax.set_yticklabels([])
 
-        ref_ax.set_ylabel(cfg.get("ylabel", row_configs[row_index].get("y_label", "Average score")), fontsize=SUBFIG_TITLE_FONTSIZE)
+        # ylabel（用 row_configs[row_index]，避免 cfg 引用到外层旧变量）
+        ylabel = row_configs[row_index].get("ylabel",
+                row_configs[row_index].get("y_label", "Average score"))
+        ref_ax.set_ylabel(ylabel, fontsize=SUBFIG_TITLE_FONTSIZE)
+
         # move y-label further left
         ref_ax.yaxis.set_label_coords(-0.4, 0.5)
 
@@ -959,7 +1027,7 @@ def plot_avg_returns_per_cable_4rows(
         loc="lower center",
         ncol=4,                  # one row
         frameon=False,
-        bbox_to_anchor=(0.5, -0.02),
+        bbox_to_anchor=(0.5, -0.04),
         fontsize=LEGEND_FONTSIZE,
     )
 
@@ -972,6 +1040,5 @@ def plot_avg_returns_per_cable_4rows(
         wspace=0.4,
     )
 
-    plt.savefig(save_path)
+    plt.savefig(save_path, bbox_inches='tight')
     plt.show()
-
