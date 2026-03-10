@@ -211,7 +211,7 @@ def compute_group_typed_statistics(base_dir, env_step=5):
         grouped_trajs[group_key]["total_effort_list"].append(total_effort)
         grouped_trajs[group_key]["push_energy_list"].append(utils_integral(obs[:terminal_index, 3], obs[:terminal_index, 4]))
         grouped_trajs[group_key]["deformation_list"].append(np.max((obs[:terminal_index, 4])))
-        grouped_trajs[group_key]["duration_list"].append(terminal_index)
+        grouped_trajs[group_key]["duration_list"].append(terminal_index*env_step)
         grouped_refs[group_key]["dirs"].append(int(traj_dir))
 
     for group_key, group_traj in grouped_trajs.items():
@@ -744,6 +744,12 @@ if __name__ == "__main__":
     trained_normal_returns = load_and_evaluate_episodes(trained_with_encoder_dir, effort_and_energy_based_criterion_function, random_ref_values, env_step=5, plot=False)
     # trained_exp_returns = load_and_evaluate_episodes(trained_with_encoder_dir, effort_and_energy_based_exponential_criterion_function, random_ref_values, env_step=5, plot=False)
 
+    # delete R_S_M_12 groups from both
+    trained_normal_returns = {k: v for k, v in trained_normal_returns.items() if "R_S_M_1" not in k}
+    random_normal_returns = {k: v for k, v in random_normal_returns.items() if "R_S_M_1" not in k}
+    trained_raw_values = {k: v for k, v in trained_raw_values.items() if "R_S_M_1" not in k}
+    random_raw_values = {k: v for k, v in random_raw_values.items() if "R_S_M_1" not in k}
+
     # plot two returns for comparison
     # plot_group_returns_subplots(
     #     random_normal_returns,
@@ -764,29 +770,33 @@ if __name__ == "__main__":
             "random_returns": random_normal_returns,
             "trained_returns": trained_normal_returns,
             "properties": ("total_energy", "total_effort"),
-            "y_label": r"$c_i$",
+            "y_label": r"$c_i\!\uparrow$",
             "style": "split",
+            "n_ticks": 4
         },
         {
             "random_returns": random_raw_values,
             "trained_returns": trained_raw_values,
             "properties": ("stretch_energy_list",),
-            "y_label": r"$U_{l}^{s}$",
+            "y_label": r"$U_{l}^{s} \ (N \cdot m)\!\downarrow$",
             "style": "violin",
+            "n_ticks": 3
         },
         {
             "random_returns": random_raw_values,
             "trained_returns": trained_raw_values,
             "properties": ("push_energy_list",),
-            "y_label": r"$U_{l}^{b}$",
+            "y_label": r"$U_{l}^{b} \ (N \cdot m)\!\downarrow$",
             "style": "violin",
+            "n_ticks": 4
         },
         {
             "random_returns": random_raw_values,
             "trained_returns": trained_raw_values,
             "properties": ("duration_list",),
-            "y_label": r"$T$",
+            "y_label": r"$T \ (ms)\!\downarrow$",
             "style": "violin",
+            "n_ticks": 3
         },
     ]
 
@@ -794,27 +804,27 @@ if __name__ == "__main__":
         labels=("Random", "Trained"),
         row_configs=row_configs,
         title="Comparison of Policies over DLOs and Fixtures",
-        save_path=os.path.join(trained_with_encoder_dir, "avg_scores_per_cable.png")
+        save_path=os.path.join(trained_with_encoder_dir, "avg_scores_per_cable.pdf")
     )
 
-    plot_avg_returns_per_cable(
-        random_returns=random_normal_returns,
-        trained_returns=trained_normal_returns,
-        labels=("Random", "Trained"),
-        properties=("total_energy", "total_effort"),
-        title="Average scores of each DLO and clip",
-        save_path=os.path.join(trained_with_encoder_dir, "avg_scores_per_cable.png"),
-        style="split",
-    )
+    # plot_avg_returns_per_cable(
+    #     random_returns=random_normal_returns,
+    #     trained_returns=trained_normal_returns,
+    #     labels=("Random", "Trained"),
+    #     properties=("total_energy", "total_effort"),
+    #     title="Average scores of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_scores_per_cable.png"),
+    #     style="split",
+    # )
 
-    plot_avg_returns_per_cable(
-        random_returns=random_raw_values,
-        trained_returns=trained_raw_values,
-        labels=("Random", "Trained"),
-        properties=("stretch_energy_list", ),
-        title="Average stretch energies of each DLO and clip",
-        save_path=os.path.join(trained_with_encoder_dir, "avg_stretch_energy_per_cable.png")
-    )
+    # plot_avg_returns_per_cable(
+    #     random_returns=random_raw_values,
+    #     trained_returns=trained_raw_values,
+    #     labels=("Random", "Trained"),
+    #     properties=("stretch_energy_list", ),
+    #     title="Average stretch energies of each DLO and clip",
+    #     save_path=os.path.join(trained_with_encoder_dir, "avg_stretch_energy_per_cable.png")
+    # )
 
 
     # plot_avg_returns_per_cable_bar_split(
