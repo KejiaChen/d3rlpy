@@ -26,279 +26,159 @@ def plot_avg_returns_per_cable_bar(
     save_path="avg_returns_per_cable.png"
 ):
     """
-    One 2D bar subplot per cable_id (average over trials per clip_id).
+    One bar subplot per cable_id (average over trials per clip_id).
 
-    - X axis: clip_id
-    - Bars: random vs trained
-    - Each bar value = average over trials of the SUM of `properties`
-        e.g. total_energy + total_effort, or whatever you pass in.
-    - Error bars: std of that sum across trials
-    - Exactly 2 rows of subplots.
-    - Subplot width is proportional to number of clips.
-    - Bars have the same visual width across ALL subplots
-      (achieved by a single 2xN GridSpec of uniform 'clip slots').
-
-    Assumes each entry in random_returns / trained_returns looks like:
-        {
-            "cable_id": ...,
-            "clip_id": ...,
-            "<prop1>": [ ... ],   # per trial
-            "<prop2>": [ ... ],
-            ...
-        }
-    where <propX> are the names in `properties`.
+    - All subplots are on ONE ROW.
+    - Bars: random vs trained.
+    - Bar height = mean over trials of SUM(properties)
+    - Error bar = std over trials of SUM(properties)
+    - Width of each subplot proportional to number of clips for that cable.
+    - Shared y-axis ticks on leftmost subplot only.
     """
 
-    properties = tuple(properties)  # just to be safe
+    properties = tuple(properties)
 
-    # 1) Aggregate raw data: (cable_id, clip_id) -> list of summed values per trial
-    agg = defaultdict(lambda: {
-        "random_total": [],
-        "trained_total": [],
-    })
+    # ---------- 1) Aggregate per-trial sums ----------
+    agg = defaultdict(lambda: {"random": [], "trained": []})
 
-    def add_policy_data(source_dict, policy_prefix):
-        for group_key, data in source_dict.items():
-            # cable_id = data.get("cable_id")
-            # clip_id  = data.get("clip_id")
+    def add_policy(source, prefix):
+        for group_key, data in source.items():
             cable_id = group_key[:7]
             clip_id  = group_key[8:13]
-            if cable_id is None or clip_id is None:
-                continue
 
-            # collect lists for all requested properties
+            key = (cable_id, clip_id)
+
             prop_lists = []
             for prop in properties:
                 vals = data.get(prop, [])
                 vals = [float(v) for v in vals]
                 prop_lists.append(vals)
 
-            # drop if no property has data
             non_empty = [lst for lst in prop_lists if len(lst) > 0]
             if not non_empty:
                 continue
 
-            # ensure same number of trials by truncating to min length
-            n_trials = min(len(lst) for lst in non_empty)
-            if n_trials == 0:
+            n = min(len(lst) for lst in non_empty)
+            if n == 0:
                 continue
 
-            # compute per-trial sum over properties
+            # compute per-trial sum
             summed = []
-            for i in range(n_trials):
+            for i in range(n):
                 s = 0.0
                 for lst in prop_lists:
                     if i < len(lst):
                         s += lst[i]
                 summed.append(s)
 
-            key = (cable_id, clip_id)
-            agg[key][f"{policy_prefix}_total"].extend(summed)
+            agg[key][prefix].extend(summed)
 
-    # Random + trained
-    add_policy_data(random_returns,  "random")
-    add_policy_data(trained_returns, "trained")
+    add_policy(random_returns, "random")
+    add_policy(trained_returns, "trained")
 
-    # 2) Per-cable structure: mean/std of the summed properties
-    # cable_id -> clip_id -> dict(...)
+    # ---------- 2) Build cable → clip stats ----------
     cable_to_clips = defaultdict(dict)
-    for (cable_id, clip_id), d in agg.items():
-        # --- random ---
-        r_tot = d["random_total"]
-        if r_tot:
-            mean_r = float(np.mean(r_tot))
-            std_r  = float(np.std(r_tot, ddof=0))
-        else:
-            mean_r, std_r = np.nan, np.nan
 
-        # --- trained ---
-        t_tot = d["trained_total"]
-        if t_tot:
-            mean_t = float(np.mean(t_tot))
-            std_t  = float(np.std(t_tot, ddof=0))
+    for (cable_id, clip_id), d in agg.items():
+
+        r = np.array(d["random"], dtype=float)
+        if len(r) > 0:
+            mr, sr = float(np.mean(r)), float(np.std(r, ddof=0))
         else:
-            mean_t, std_t = np.nan, np.nan
+            mr, sr = np.nan, np.nan
+
+        t = np.array(d["trained"], dtype=float)
+        if len(t) > 0:
+            mt, st = float(np.mean(t)), float(np.std(t, ddof=0))
+        else:
+            mt, st = np.nan, np.nan
 
         cable_to_clips[cable_id][clip_id] = {
-            "mean_random":  mean_r,
-            "std_random":   std_r,
-            "mean_trained": mean_t,
-            "std_trained":  std_t,
+            "mean_random":  mr,
+            "std_random":   sr,
+            "mean_trained": mt,
+            "std_trained":  st,
         }
 
     if not cable_to_clips:
-        print("No (cable_id, clip_id) data found.")
+        print("No valid data found.")
         return
 
-    # 3) Layout: 2 rows, width proportional to #clips
+    # ---------- 3) Layout: ONE ROW ----------
     cable_ids = sorted(cable_to_clips.keys())
-    n_cables = len(cable_ids)
-
-    split_idx = math.ceil(n_cables / 2)
-    row0_cables = cable_ids[:split_idx]
-    row1_cables = cable_ids[split_idx:]
-
     clips_per_cable = {cid: len(cable_to_clips[cid]) for cid in cable_ids}
 
-    gap_slots = 0
+    total_slots = sum(clips_per_cable.values())
+    fig = plt.figure(figsize=(0.9 * total_slots + 3, 3))
 
-    def row_slots(cables_row):
-        if not cables_row:
-            return 1
-        return sum(clips_per_cable[cid] for cid in cables_row)
-
-    total_clips_row0 = row_slots(row0_cables)
-    total_clips_row1 = row_slots(row1_cables)
-    total_slots = max(total_clips_row0, total_clips_row1)
-
-    # Wider figure: more horizontal room overall
-    fig = plt.figure(figsize=(0.9 * total_slots + 7, 9))
-    gs = fig.add_gridspec(2, total_slots, width_ratios=[1] * total_slots)
+    gs = fig.add_gridspec(1, total_slots, width_ratios=[1]*total_slots)
 
     bar_width = 0.35
-    axes_row0 = []
-    axes_row1 = []
+    axes = []
 
-    # We'll collect all values (means ± std) to compute a global y-range
     all_y_vals = []
+    col_start = 0
 
-    def plot_row(cable_ids_row, row_index):
-        """Place each cable in this row, spanning slots equal to its #clips, with gaps."""
-        nonlocal all_y_vals
-        row_axes = []
-        col_start = 0
+    # ---------- 4) Draw each subplot ----------
+    for cable_id in cable_ids:
+        n_clips = clips_per_cable[cable_id]
+        clip_ids = sorted(cable_to_clips[cable_id].keys())
+        x = np.arange(n_clips)
 
-        for _, cable_id in enumerate(cable_ids_row):
-            n_clips = clips_per_cable[cable_id]
-            if n_clips == 0:
-                continue
+        ax = fig.add_subplot(gs[0, col_start:col_start+n_clips])
+        axes.append(ax)
 
-            col_end = col_start + n_clips
-            ax = fig.add_subplot(gs[row_index, col_start:col_end])
-            row_axes.append(ax)
+        means_r = np.array([cable_to_clips[cable_id][cid]["mean_random"] for cid in clip_ids])
+        std_r   = np.array([cable_to_clips[cable_id][cid]["std_random"] for cid in clip_ids])
+        means_t = np.array([cable_to_clips[cable_id][cid]["mean_trained"] for cid in clip_ids])
+        std_t   = np.array([cable_to_clips[cable_id][cid]["std_trained"] for cid in clip_ids])
 
-            clip_dict = cable_to_clips[cable_id]
-            clip_ids = sorted(clip_dict.keys())
-            x = np.arange(n_clips)
+        # collect for shared y-axis
+        for m, s in zip(means_r, std_r):
+            if not np.isnan(m):
+                all_y_vals.append(m)
+                all_y_vals.append(m + s)
+        for m, s in zip(means_t, std_t):
+            if not np.isnan(m):
+                all_y_vals.append(m)
+                all_y_vals.append(m + s)
 
-            means_random = []
-            std_random = []
-            means_trained = []
-            std_trained = []
+        # bars
+        ax.bar(x - bar_width/2, means_r, width=bar_width, yerr=std_r, capsize=3, label=labels[0])
+        ax.bar(x + bar_width/2, means_t, width=bar_width, yerr=std_t, capsize=3, label=labels[1])
 
-            for clip_id in clip_ids:
-                stats = clip_dict[clip_id]
-                means_random.append(stats["mean_random"])
-                std_random.append(stats["std_random"])
-                means_trained.append(stats["mean_trained"])
-                std_trained.append(stats["std_trained"])
+        ax.set_title(cable_id)
+        ax.set_xticks(x)
+        ax.set_xticklabels(clip_ids)
 
-            means_random = np.array(means_random, dtype=float)
-            std_random = np.array(std_random, dtype=float)
-            means_trained = np.array(means_trained, dtype=float)
-            std_trained = np.array(std_trained, dtype=float)
+        col_start += n_clips
 
-            # collect values for global y-limits (mean ± std)
-            for m, s in zip(means_random, std_random):
-                if not np.isnan(m):
-                    all_y_vals.append(m)
-                    if not np.isnan(s):
-                        all_y_vals.append(m + s)
-                        all_y_vals.append(m - s)
-            for m, s in zip(means_trained, std_trained):
-                if not np.isnan(m):
-                    all_y_vals.append(m)
-                    if not np.isnan(s):
-                        all_y_vals.append(m + s)
-                        all_y_vals.append(m - s)
-
-            # Bars + error bars (sum of properties)
-            ax.bar(
-                x - bar_width / 2,
-                means_random,
-                width=bar_width,
-                yerr=std_random,
-                capsize=3,
-                label=labels[0],
-            )
-            ax.bar(
-                x + bar_width / 2,
-                means_trained,
-                width=bar_width,
-                yerr=std_trained,
-                capsize=3,
-                label=labels[1],
-            )
-
-            ax.set_title(f"{cable_id}", fontsize=SUBFIG_TITLE_FONTSIZE)
-            ax.set_xticks(x)
-            ax.set_xticklabels(clip_ids, rotation=0, ha="center", fontsize=TICK_FONTSIZE)
-            ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
-
-            # move start to end + gap_slots
-            col_start = col_end + gap_slots
-
-        return row_axes
-
-    axes_row0 = plot_row(row0_cables, 0)
-    axes_row1 = plot_row(row1_cables, 1)
-    axes = axes_row0 + axes_row1
-
-    # ------------- GLOBAL Y AXIS FOR ALL SUBPLOTS --------------------
-    if all_y_vals and axes:
-        global_max = max(all_y_vals)
-        if global_max <= 0:
-            global_max = 1.0
-
-        # Global y limits: always start at zero for bar charts
-        ylim = (0, global_max * 1.05)
-
-        # Apply the same limits to all axes
+    # ---------- 5) Shared y-axis ----------
+    if all_y_vals:
+        ymax = max(all_y_vals)
         for ax in axes:
-            ax.set_ylim(ylim)
+            ax.set_ylim(0, ymax * 1.05)
 
-        # Force draw so ticks are computed
+        # sync y-ticks
         fig.canvas.draw()
+        ref_ticks = axes[0].get_yticks()
+        ref_ticklabels = [t.get_text() for t in axes[0].get_yticklabels()]
 
-        # Take ticks from the first axis as global ticks
-        ref_ax = axes[0]
-        ref_ticks = ref_ax.get_yticks()
-        ref_ticklabels = [lab.get_text() for lab in ref_ax.get_yticklabels()]
-
-        # Apply same ticks everywhere
-        for ax in axes:
+        for i, ax in enumerate(axes):
             ax.set_yticks(ref_ticks)
-            ax.set_yticklabels(ref_ticklabels, fontsize=TICK_FONTSIZE)
+            ax.set_yticklabels(ref_ticklabels if i == 0 else [""]*len(ref_ticks))
 
-        # Only leftmost subplot in each row shows labels
-        if len(axes_row0) > 1:
-            for ax in axes_row0[1:]:
-                ax.set_yticklabels([])
+    fig.supylabel("Average score")
+    fig.suptitle(title)
 
-        if len(axes_row1) > 1:
-            for ax in axes_row1[1:]:
-                ax.set_yticklabels([])
+    fig.legend(labels, loc='center right', bbox_to_anchor=(0.98, 0.5), frameon=False)
 
-    fig.supylabel("Average score", fontsize=FIG_TITLE_FONTSIZE)
-    fig.suptitle(title, y=0.95, fontsize=FIG_TITLE_FONTSIZE)
-
-    # Global legend with more right margin
-    fig.legend(
-        labels,
-        loc="center right",
-        bbox_to_anchor=(0.95, 0.8),
-        frameon=False,
-        fontsize=LEGEND_FONTSIZE,
-    )
-
-    # Layout: keep margins for ylabel and legend, and add vertical spacing
     fig.subplots_adjust(
-        left=0.06,   # room for y-label
-        right=0.95,  # space on the right for legend
+        left=0.08,
+        right=0.90,
         top=0.85,
-        bottom=0.08,
-        hspace=0.3,
-        wspace=0.5,
+        bottom=0.12,
+        wspace=0.4
     )
 
     plt.savefig(save_path)
@@ -313,16 +193,15 @@ def plot_avg_returns_per_cable_bar_split(
     save_path="avg_returns_per_cable.png"
 ):
     """
-    One 2D bar subplot per cable_id (average over trials per clip_id).
+    One bar subplot per cable_id (average over trials per clip_id).
 
+    - All subplots are on ONE ROW.
     - X axis: clip_id
     - Bars: random vs trained
     - Each bar is a stack of the given `properties`, e.g. ("total_energy", "total_effort")
     - Error bars: std of the TOTAL (sum over `properties`) across trials
-    - Exactly 2 rows of subplots.
     - Subplot width is proportional to number of clips.
-    - Bars have the same visual width across ALL subplots
-      (achieved by a single 2xN GridSpec of uniform 'clip slots').
+    - Bars have the same visual width across ALL subplots.
 
     Assumes each entry in random_returns / trained_returns looks like:
         {
@@ -411,14 +290,8 @@ def plot_avg_returns_per_cable_bar_split(
         print("No (cable_id, clip_id) data found.")
         return
 
-    # 3) Layout: 2 rows, width proportional to #clips
+    # 3) Layout: ONE ROW, width proportional to #clips
     cable_ids = sorted(cable_to_clips.keys())
-    n_cables = len(cable_ids)
-
-    split_idx = math.ceil(n_cables / 2)
-    row0_cables = cable_ids[:split_idx]
-    row1_cables = cable_ids[split_idx:]
-
     clips_per_cable = {cid: len(cable_to_clips[cid]) for cid in cable_ids}
 
     gap_slots = 0
@@ -428,23 +301,20 @@ def plot_avg_returns_per_cable_bar_split(
             return 1
         return sum(clips_per_cable[cid] for cid in cables_row)
 
-    total_clips_row0 = row_slots(row0_cables)
-    total_clips_row1 = row_slots(row1_cables)
-    total_slots = max(total_clips_row0, total_clips_row1)
+    total_slots = row_slots(cable_ids)
 
-    fig = plt.figure(figsize=(0.9 * total_slots + 7, 9))
-    gs = fig.add_gridspec(2, total_slots, width_ratios=[1] * total_slots)
+    fig = plt.figure(figsize=(0.9 * total_slots + 3, 3.5))
+    gs = fig.add_gridspec(1, total_slots, width_ratios=[1] * total_slots)
 
     bar_width = 0.35
-    axes_row0 = []
-    axes_row1 = []
-
+    axes = []
     all_y_vals = []
 
     def prettify(name: str) -> str:
         return name.replace("_", " ").capitalize()
 
-    def plot_row(cable_ids_row, row_index):
+    # Single-row plotting (row_index = 0)
+    def plot_row(cable_ids_row, row_index=0):
         nonlocal all_y_vals
         row_axes = []
         col_start = 0
@@ -551,18 +421,18 @@ def plot_avg_returns_per_cable_bar_split(
                 ecolor="black",
             )
 
+            show_clip_ids = [clip_id[2:] for clip_id in clip_ids]
+
             ax.set_title(f"{cable_id}", fontsize=SUBFIG_TITLE_FONTSIZE)
             ax.set_xticks(x)
-            ax.set_xticklabels(clip_ids, rotation=0, ha="center", fontsize=TICK_FONTSIZE)
+            ax.set_xticklabels(show_clip_ids, rotation=0, ha="center", fontsize=TICK_FONTSIZE)
             ax.tick_params(axis="y", labelsize=TICK_FONTSIZE)
 
             col_start = col_end + gap_slots
 
         return row_axes
 
-    axes_row0 = plot_row(row0_cables, 0)
-    axes_row1 = plot_row(row1_cables, 1)
-    axes = axes_row0 + axes_row1
+    axes = plot_row(cable_ids, 0)
 
     # ------------- GLOBAL Y AXIS FOR ALL SUBPLOTS --------------------
     if all_y_vals and axes:
@@ -581,16 +451,11 @@ def plot_avg_returns_per_cable_bar_split(
         ref_ticks = ref_ax.get_yticks()
         ref_ticklabels = [lab.get_text() for lab in ref_ax.get_yticklabels()]
 
-        for ax in axes:
+        for i, ax in enumerate(axes):
             ax.set_yticks(ref_ticks)
-            ax.set_yticklabels(ref_ticklabels, fontsize=TICK_FONTSIZE)
-
-        if len(axes_row0) > 1:
-            for ax in axes_row0[1:]:
-                ax.set_yticklabels([])
-
-        if len(axes_row1) > 1:
-            for ax in axes_row1[1:]:
+            if i == 0:
+                ax.set_yticklabels(ref_ticklabels, fontsize=TICK_FONTSIZE)
+            else:
                 ax.set_yticklabels([])
 
     fig.supylabel("Average score", fontsize=FIG_TITLE_FONTSIZE)
@@ -613,22 +478,21 @@ def plot_avg_returns_per_cable_bar_split(
             unique_labels.append(l)
             seen.add(l)
 
-    fig.legend(
-        unique_handles,
-        unique_labels,
-        loc="center right",
-        bbox_to_anchor=(0.95, 0.8),
-        frameon=False,
-        fontsize=LEGEND_FONTSIZE,
-    )
+    # fig.legend(
+    #     unique_handles,
+    #     unique_labels,
+    #     loc="center right",
+    #     bbox_to_anchor=(0.95, 0.8),
+    #     frameon=False,
+    #     fontsize=LEGEND_FONTSIZE,
+    # )
 
     fig.subplots_adjust(
         left=0.06,
         right=0.95,
         top=0.85,
         bottom=0.08,
-        hspace=0.3,
-        wspace=0.5,
+        wspace=0.5,   # only horizontal spacing matters now
     )
 
     plt.savefig(save_path)
