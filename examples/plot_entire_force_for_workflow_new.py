@@ -21,6 +21,11 @@ mpl.rcParams.update(
     }
 )
 
+COL_STRETCH =  (167 / 255.0, 139 / 255.0, 250 / 255.0)
+COL_PUSH = (238 / 255.0, 124 / 255.0, 139 / 255.0)
+ALPHA_EXT = 0.7
+ALPHA_FF = 1.0
+
 
 @dataclass
 class Episode:
@@ -72,7 +77,7 @@ def load_fixing_episodes(fixing_dir: str, env_step: int) -> List[Episode]:
     fixing_trials = list_subdirs(fixing_dir)
     episodes: List[Episode] = []
 
-    for trial_name in fixing_trials:
+    for trial_idx, trial_name in enumerate(fixing_trials, start=1):
         trial_path = os.path.join(fixing_dir, trial_name)
         mios_trials = list_subdirs(trial_path)
         if not mios_trials:
@@ -97,6 +102,15 @@ def load_fixing_episodes(fixing_dir: str, env_step: int) -> List[Episode]:
 
         if obs is None or acts is None or terminals is None:
             continue
+
+        # Trial 2 uses the opposite push sign in the source logs.
+        if trial_idx == 2:
+            obs = obs.copy()
+            acts = acts.copy()
+            if obs.shape[1] > 1:
+                obs[:, 1] *= -1.0
+            if acts.shape[1] > 1:
+                acts[:, 1] *= -1.0
 
         episodes.append(
             Episode(
@@ -239,21 +253,33 @@ def load_transport_episodes(
 
 
 def build_interleaved_plot_list(
-    transport_eps: List[Episode], fixing_eps: List[Episode], n_pairs: int
-) -> List[Episode]:
+    transport_eps: List[Episode],
+    fixing_eps: List[Episode],
+    start_pair: int,
+    end_pair: int,
+) -> tuple[List[Episode], int, int]:
     max_pairs = min(len(transport_eps), len(fixing_eps))
     if max_pairs == 0:
-        return []
-    if n_pairs <= 0:
-        use_pairs = max_pairs
-    else:
-        use_pairs = min(max_pairs, n_pairs)
+        return [], -1, -1
+
+    if start_pair < 1:
+        raise ValueError(f"start_pair must be >= 1, got {start_pair}")
+    if end_pair < 1:
+        raise ValueError(f"end_pair must be >= 1, got {end_pair}")
+    if end_pair < start_pair:
+        raise ValueError(f"end_pair ({end_pair}) must be >= start_pair ({start_pair})")
+    start_idx = start_pair - 1
+    if start_idx >= max_pairs:
+        return [], -1, -1
+    end_idx = min(max_pairs, end_pair) - 1
 
     plot_list: List[Episode] = []
-    for i in range(use_pairs):
+    for i in range(start_idx, end_idx + 1):
         plot_list.append(transport_eps[i])
         plot_list.append(fixing_eps[i])
-    return plot_list
+
+    print(f"Using pair range: {start_idx + 1} to {end_idx + 1} (total {end_idx - start_idx + 1})")
+    return plot_list, start_idx + 1, end_idx + 1
 
 
 def compute_segment_layout(
@@ -324,12 +350,11 @@ def draw_episode_segment(
     show_ylabel: bool,
     show_xlabel: bool,
 ):
-    col_stretch = (167 / 255.0, 139 / 255.0, 250 / 255.0) # "#ee7c8b"  # (93 / 255.0, 184 / 255.0, 71 / 255.0)
-    col_push =  (238 / 255.0, 124 / 255.0, 139 / 255.0)   #"#9c6ade"  # (238 / 255.0, 124 / 255.0, 139 / 255.0)
-    alpha_ext = 0.6
-
     ax.set_axisbelow(True)
     ax.grid(True, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["bottom"].set_visible(True)
 
     if ep.source == "fixing":
         n = ep.obs.shape[0]
@@ -347,7 +372,7 @@ def draw_episode_segment(
                 time_ff,
                 ep.acts[ff_start_idx : ff_end_idx + 1, 0],
                 "--",
-                color=col_stretch,
+                color=(*COL_STRETCH, ALPHA_FF),
                 linewidth=linewidth,
                 zorder=2,
             )
@@ -355,7 +380,7 @@ def draw_episode_segment(
                 time_ff,
                 ep.acts[ff_start_idx : ff_end_idx + 1, 1],
                 "--",
-                color=col_push,
+                color=(*COL_PUSH, ALPHA_FF),
                 linewidth=linewidth,
                 zorder=2,
             )
@@ -364,7 +389,7 @@ def draw_episode_segment(
             time_full,
             ep.obs[: range_end_idx + 1, 0],
             "-",
-            color=(*col_stretch, alpha_ext),
+            color=(*COL_STRETCH, ALPHA_EXT),
             linewidth=linewidth,
             zorder=2,
         )
@@ -373,13 +398,13 @@ def draw_episode_segment(
             time_full,
             ep.obs[: range_end_idx + 1, obs_push_idx],
             "-",
-            color=(*col_push, alpha_ext),
+            color=(*COL_PUSH, ALPHA_EXT),
             linewidth=linewidth,
             zorder=2,
         )
 
         if ep.fixing_success:
-            ax.axvline(finish_this, linestyle="-.", color="black", linewidth=linewidth, zorder=4)
+            ax.axvline(finish_this, linestyle="-.", color="black", linewidth=linewidth-2, zorder=4)
     else:
         n = ep.obs.shape[0]
         term_idxs = np.flatnonzero(ep.terminals)
@@ -389,7 +414,7 @@ def draw_episode_segment(
             t,
             ep.obs[: term_idx + 1, 0],
             "-",
-            color=(*col_stretch, alpha_ext),
+            color=(*COL_STRETCH, ALPHA_EXT),
             linewidth=linewidth,
             zorder=2,
         )
@@ -404,7 +429,7 @@ def draw_episode_segment(
         if grid_lines:
             grid_lw = grid_lines[0].get_linewidth()
         # Light-gray mask region, then draw darker horizontal lines aligned with major Y ticks.
-        ax.axvspan(end_plot_this, x_end_this, facecolor=(0.88, 0.88, 0.88), alpha=1.0, zorder=5)
+        ax.axvspan(end_plot_this, x_end_this, facecolor=(0.88, 0.88, 0.88), alpha=0.5, zorder=5)
         for y in ax.get_yticks():
             if ylim[0] <= y <= ylim[1]:
                 ax.plot(
@@ -421,7 +446,9 @@ def draw_episode_segment(
 
     if show_ylabel:
         ax.set_ylabel("Force (N)")
+        ax.spines["left"].set_visible(True)
     else:
+        ax.spines["left"].set_visible(False)
         ax.tick_params(axis="y", left=False, labelleft=False)
 
     if show_xlabel:
@@ -522,10 +549,6 @@ def export_pages(
 
 
 def export_legend_only(out_stem: str, linewidth: float, dpi_png: int):
-    col_stretch = (93 / 255.0, 184 / 255.0, 71 / 255.0)
-    col_push = (238 / 255.0, 124 / 255.0, 139 / 255.0)
-    alpha_ext = 0.6
-
     fig = plt.figure(figsize=(18, 1.5), dpi=100)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1)
@@ -534,10 +557,10 @@ def export_legend_only(out_stem: str, linewidth: float, dpi_png: int):
 
     labels = ["FF Stretch", "FF Push", "Ext Stretch", "Ext Push", "Finish"]
     styles = [
-        {"color": col_stretch, "linestyle": "--", "alpha": 1.0},
-        {"color": col_push, "linestyle": "--", "alpha": 1.0},
-        {"color": col_stretch, "linestyle": "-", "alpha": alpha_ext},
-        {"color": col_push, "linestyle": "-", "alpha": alpha_ext},
+        {"color": COL_STRETCH, "linestyle": "--", "alpha": 1.0},
+        {"color": COL_PUSH, "linestyle": "--", "alpha": 1.0},
+        {"color": COL_STRETCH, "linestyle": "-", "alpha": ALPHA_EXT},
+        {"color": COL_PUSH, "linestyle": "-", "alpha": ALPHA_EXT},
         {"color": (0.0, 0.0, 0.0), "linestyle": "-.", "alpha": 1.0},
     ]
 
@@ -582,10 +605,11 @@ def main():
     parser.add_argument("--plan-scene", default="target_shape_plane5_10")
     parser.add_argument("--cable-name", default="B_L_L")
     parser.add_argument("--env-step", type=int, default=5)
-    parser.add_argument("--n-pairs", type=int, default=3, help="<=0 means use all available pairs")
+    parser.add_argument("--start-pair", type=int, default=4, help="1-based start pair index (inclusive)")
+    parser.add_argument("--end-pair", type=int, default=4, help="1-based end pair index (inclusive)")
     parser.add_argument("--smoothing-window", type=int, default=150)
     parser.add_argument("--topup-length", type=int, default=1000)
-    parser.add_argument("--add-length", type=int, default=1000)
+    parser.add_argument("--add-length", type=int, default=2000)
     parser.add_argument("--fixing-tail-ms", type=int, default=1000)
     parser.add_argument("--px-per-ms", type=float, default=0.1)
     parser.add_argument("--page-width-px", type=int, default=12000)
@@ -617,7 +641,12 @@ def main():
     )
     print(f"Loaded {len(transport_eps)} transport episodes")
 
-    plot_list = build_interleaved_plot_list(transport_eps, fixing_eps, n_pairs=args.n_pairs)
+    plot_list, used_start_pair, used_end_pair = build_interleaved_plot_list(
+        transport_eps,
+        fixing_eps,
+        start_pair=args.start_pair,
+        end_pair=args.end_pair,
+    )
     if not plot_list:
         raise RuntimeError("No interleaved episodes available. Check fixing/transport trial folders.")
 
@@ -629,7 +658,11 @@ def main():
         fixing_tail_ms=args.fixing_tail_ms,
     )
 
-    out_stem = os.path.join(transport_dir, f"whole_process_{args.plan_scene}_{args.cable_name}")
+    out_stem = os.path.join(
+        transport_dir,
+        f"whole_process_{args.plan_scene}_{args.cable_name}_pairs_{used_start_pair:02d}-{used_end_pair:02d}",
+    )
+    legend_stem = os.path.join(transport_dir, f"whole_process_{args.plan_scene}_{args.cable_name}")
     export_pages(
         plot_list=plot_list,
         layout=layout,
@@ -645,7 +678,7 @@ def main():
         pad_b=95,
         pad_t=20,
     )
-    export_legend_only(out_stem=out_stem, linewidth=7.0, dpi_png=args.dpi_png)
+    export_legend_only(out_stem=legend_stem, linewidth=7.0, dpi_png=args.dpi_png)
 
     print("done")
 
