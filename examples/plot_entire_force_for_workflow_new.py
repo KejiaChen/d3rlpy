@@ -7,6 +7,7 @@ from typing import List
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 
 
 mpl.rcParams.update(
@@ -410,6 +411,15 @@ def draw_episode_segment(
         term_idxs = np.flatnonzero(ep.terminals)
         term_idx = int(term_idxs[-1]) if term_idxs.size else n - 1
         t = np.arange(0, term_idx + 1, dtype=np.float64)
+        # Draw target only over the real transport window (exclude gray padded region).
+        ax.plot(
+            [0.0, end_plot_this],
+            [6.0, 6.0],
+            linestyle="--",
+            color="black",
+            linewidth=max(1.0, linewidth - 2.0),
+            zorder=1,
+        )
         ax.plot(
             t,
             ep.obs[: term_idx + 1, 0],
@@ -549,48 +559,47 @@ def export_pages(
 
 
 def export_legend_only(out_stem: str, linewidth: float, dpi_png: int):
-    fig = plt.figure(figsize=(18, 1.5), dpi=100)
+    fig = plt.figure(figsize=(24, 1.6), dpi=100)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
 
-    labels = ["FF Stretch", "FF Push", "Ext Stretch", "Ext Push", "Finish"]
+    labels = ["FF Stretch", "FF Push", "Ext Stretch", "Ext Push", "Finish", "Transport Target (6 N)"]
     styles = [
         {"color": COL_STRETCH, "linestyle": "--", "alpha": 1.0},
         {"color": COL_PUSH, "linestyle": "--", "alpha": 1.0},
         {"color": COL_STRETCH, "linestyle": "-", "alpha": ALPHA_EXT},
         {"color": COL_PUSH, "linestyle": "-", "alpha": ALPHA_EXT},
         {"color": (0.0, 0.0, 0.0), "linestyle": "-.", "alpha": 1.0},
+        {"color": (0.0, 0.0, 0.0), "linestyle": "--", "alpha": 1.0},
     ]
 
-    y_center = 0.5
-    start_x = 0.03
-    spacing = 0.205
-    icon_len = 0.085
-    icon_text_gap = 0.014
-    legend_linewidth = max(2.0, (linewidth - 1.5) * 1.2)
-
-    for i, (label, style) in enumerate(zip(labels, styles)):
-        xc = start_x + i * spacing
-        x1 = xc - icon_len / 2.0
-        x2 = xc + icon_len / 2.0
-        ax.plot(
-            [x1, x2],
-            [y_center, y_center],
+    legend_linewidth = max(2.0, linewidth - 2.0)
+    handles = [
+        Line2D(
+            [0],
+            [0],
             linestyle=style["linestyle"],
             linewidth=legend_linewidth,
             color=(*style["color"], style["alpha"]),
             solid_capstyle="butt",
         )
-        ax.text(
-            x2 + icon_text_gap,
-            y_center,
-            label,
-            va="center",
-            ha="left",
-            fontsize=24,
-        )
+        for style in styles
+    ]
+
+    ax.legend(
+        handles,
+        labels,
+        loc="center",
+        ncol=len(labels),
+        frameon=False,
+        fontsize=19,
+        handlelength=4.0,
+        handletextpad=0.35,
+        columnspacing=1.0,
+        borderaxespad=0.0,
+    )
 
     out_pdf = f"{out_stem}_legend.pdf"
     out_png = f"{out_stem}_legend.png"
@@ -598,6 +607,11 @@ def export_legend_only(out_stem: str, linewidth: float, dpi_png: int):
     fig.savefig(out_png, dpi=dpi_png, bbox_inches="tight", pad_inches=0.03)
     plt.close(fig)
 
+
+'''
+Plot forces in SR Fig 4 Full assembly experiments.
+Change start-pair and end-pair to select which pairs of fixing/transport trials to plot.
+'''
 
 def main():
     parser = argparse.ArgumentParser(description="Plot interleaved transport/fixing force workflow.")
